@@ -2687,44 +2687,59 @@ int ObRawExprUtils::try_add_cast_expr_above(ObRawExprFactory *expr_factory,
   CK(OB_NOT_NULL(session) && OB_NOT_NULL(expr_factory));
   OZ(ObRawExprUtils::check_need_cast_expr(src_type, dst_type, need_cast, ignore_dup_cast_error));
   if (OB_SUCC(ret) && need_cast) {
+    // The same expression tree can be deduced more than once. A predicate that
+    // a rewrite rule changed is formalized again, for example, and the operand
+    // already carries the implicit cast added by the previous deduction pass.
+    // Stacking another implicit cast on top of it is redundant and used to
+    // raise OB_ERR_UNEXPECTED here, so rebuild the cast from the original
+    // operand instead of aborting the statement.
+    ObRawExpr *cast_src = &expr;
     if (T_FUN_SYS_CAST == expr.get_expr_type()
         && expr.has_flag(IS_OP_OPERAND_IMPLICIT_CAST)
         && !ignore_dup_cast_error
         && !((src_type.is_collection_sql_type()
                   && (dst_type.is_character_type() || dst_type.is_null()))
-            || (src_type.is_character_type() && dst_type.is_character_type())))
-      {
-      ret = OB_ERR_UNEXPECTED;
-#ifdef DEBUG
-      LOG_ERROR("try to add implicit cast again, check if type deduction is correct",
-                K(ret), K(expr), K(dst_type),
-                K(session->get_current_query_string()));
-#else
-      LOG_WARN("try to add implicit cast again, check if type deduction is correct",
-                K(ret), K(expr), K(dst_type), K(src_type), K(ignore_dup_cast_error),
-                K(session->get_current_query_string()));
-#endif
-    } else {
-      //setup implicit cast charset convert ignore error
-      ObCastMode cm_zf = cm;
-      if ((cm_zf & CM_COLUMN_CONVERT) != 0) {
-       //if CM_CHARSET_CONVERT_IGNORE_ERR should be set is judged in column_conv expr.
+            || (src_type.is_character_type() && dst_type.is_character_type()))) {
+      ObRawExpr *origin_expr = ObRawExprUtils::skip_implicit_cast(&expr);
+      if (OB_ISNULL(origin_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null operand below implicit cast", K(ret), K(expr));
       } else {
-        cm_zf |= CM_CHARSET_CONVERT_IGNORE_ERR;
+        cast_src = origin_expr;
       }
-      // setup zerofill cm
-      // eg: select concat(cast(c_zf as char(10)), cast(col_no_zf as char(10))) from t1;
-      if (dst_type.is_string_type() &&
-          expr.get_result_type().has_result_flag(ZEROFILL_FLAG)) {
-        cm_zf |= CM_ZERO_FILL;
+    }
+    if (OB_SUCC(ret)) {
+      bool cast_src_need_cast = true;
+      bool cast_src_ignore_dup_cast_error = false;
+      OZ(ObRawExprUtils::check_need_cast_expr(cast_src->get_result_type(),
+                                              dst_type,
+                                              cast_src_need_cast,
+                                              cast_src_ignore_dup_cast_error));
+      if (OB_SUCC(ret) && !cast_src_need_cast) {
+        // the original operand already has the destination type, reuse it
+        new_expr = cast_src;
+      } else if (OB_SUCC(ret)) {
+        //setup implicit cast charset convert ignore error
+        ObCastMode cm_zf = cm;
+        if ((cm_zf & CM_COLUMN_CONVERT) != 0) {
+         //if CM_CHARSET_CONVERT_IGNORE_ERR should be set is judged in column_conv expr.
+        } else {
+          cm_zf |= CM_CHARSET_CONVERT_IGNORE_ERR;
+        }
+        // setup zerofill cm
+        // eg: select concat(cast(c_zf as char(10)), cast(col_no_zf as char(10))) from t1;
+        if (dst_type.is_string_type() &&
+            expr.get_result_type().has_result_flag(ZEROFILL_FLAG)) {
+          cm_zf |= CM_ZERO_FILL;
+        }
+        if (dst_type.get_cast_mode() != 0) {
+          cm_zf |= dst_type.get_cast_mode();
+        }
+        ObSysFunRawExpr *cast_expr = NULL;
+        OZ(ObRawExprUtils::create_cast_expr(*expr_factory, cast_src, dst_type, cast_expr,
+                                            session, false, cm_zf, local_vars, local_var_id));
+        CK(OB_NOT_NULL(new_expr = dynamic_cast<ObRawExpr*>(cast_expr)));
       }
-      if (dst_type.get_cast_mode() != 0) {
-        cm_zf |= dst_type.get_cast_mode();
-      }
-      ObSysFunRawExpr *cast_expr = NULL;
-      OZ(ObRawExprUtils::create_cast_expr(*expr_factory, &expr, dst_type, cast_expr,
-                                          session, false, cm_zf, local_vars, local_var_id));
-      CK(OB_NOT_NULL(new_expr = dynamic_cast<ObRawExpr*>(cast_expr)));
     }
   }
   return ret;
