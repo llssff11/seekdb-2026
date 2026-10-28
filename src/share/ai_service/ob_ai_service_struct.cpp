@@ -162,6 +162,7 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
   int ret = OB_SUCCESS;
   JsonObjectIterator iter = delta_jbase.object_iterator();
   bool has_api_key = false;
+  const ObString old_provider = provider_;
   while (!iter.end() && OB_SUCC(ret)) {
     ObJsonObjPair elem;
     if (OB_FAIL(iter.get_elem(elem))) {
@@ -181,7 +182,16 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
   }
 
   if (OB_SUCC(ret)) {
-    if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
+    if (!old_provider.empty() && !provider_.empty()
+        && old_provider.case_compare(provider_) != 0
+        && (!provider_need_access_key(old_provider) != !provider_need_access_key(provider_))) {
+      // An endpoint created for a local provider carries no credential, moving
+      // it to a provider that requires one would leave a broken endpoint.
+      ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+      LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("provider"), "provider");
+      LOG_WARN("provider can not be switched between local and remote provider",
+               K(ret), K(old_provider), K(provider_));
+    } else if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
       LOG_WARN("failed to encrypt access key", K(ret));
     } else if (OB_FAIL(check_valid())) {
     }

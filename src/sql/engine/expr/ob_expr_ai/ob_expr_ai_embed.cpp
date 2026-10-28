@@ -235,20 +235,36 @@ int ObExprAIEmbed::eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
       } else {
         ObAIFuncModel model(temp_allocator, *info, resolved_endpoint);
         ObArray<ObString> results;
-        if (OB_FAIL(model.call_dense_embedding_vector_v2(contents, config, results))) {
-        } else if (results.count() != group_rows.count()) {
-          ret = OB_ERR_UNEXPECTED;
-        } else {
+        int merged_ret = model.call_dense_embedding_vector_v2(contents, config, results);
+        bool merged_ok = (OB_SUCCESS == merged_ret && results.count() == group_rows.count());
+        if (!merged_ok) {
+          // A merged request is only an optimization: if the server rejects the
+          // multi input body or answers with the wrong number of vectors, the
+          // rows are sent one by one so that the result still maps to its row.
+          LOG_WARN("merged embedding request failed, retry row by row",
+                   K(merged_ret), "expected", group_rows.count(), "got", results.count());
+          if (OB_NOT_NULL(info)) {
+            results.reset();
+          }
           for (int64_t m = 0; OB_SUCC(ret) && m < group_rows.count(); ++m) {
             const int64_t row = group_rows.at(m);
-            const ObString &result = results.at(m);
-            ObDatum *result_datum = res_datum.at(row);
-            ObTextStringDatumResult str_result(expr.datum_meta_.type_, &expr, &ctx, result_datum);
-            if (OB_FAIL(str_result.init_with_batch_idx(result.length(), row))) {
-            } else if (OB_FAIL(str_result.append(result.ptr(), result.length()))) {
-            } else {
-              str_result.set_result();
+            ObString row_content = content_array.at(row)->get_string();
+            ObString single_result;
+            if (OB_FAIL(model.call_dense_embedding(row_content, config, single_result))) {
+              LOG_WARN("embedding row failed", K(ret), K(row));
+            } else if (OB_FAIL(results.push_back(single_result))) {
             }
+          }
+        }
+        for (int64_t m = 0; OB_SUCC(ret) && m < group_rows.count(); ++m) {
+          const int64_t row = group_rows.at(m);
+          const ObString &result = results.at(m);
+          ObDatum *result_datum = res_datum.at(row);
+          ObTextStringDatumResult str_result(expr.datum_meta_.type_, &expr, &ctx, result_datum);
+          if (OB_FAIL(str_result.init_with_batch_idx(result.length(), row))) {
+          } else if (OB_FAIL(str_result.append(result.ptr(), result.length()))) {
+          } else {
+            str_result.set_result();
           }
         }
       }

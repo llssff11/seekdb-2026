@@ -403,11 +403,11 @@ int ObExprAIRerank::inner_eval_ai_rerank(ObIAllocator &allocator,
   if (OB_FAIL(ObAIFuncUtils::get_rerank_body(allocator, info, endpoint_info, query, document_array, config_json, body))) {
   } else if (OB_FAIL(ai_client.send_post(allocator, endpoint_info.get_url(), header_array, body, http_response))) {
   } else if (OB_FAIL(ObAIFuncUtils::parse_rerank_output(allocator, endpoint_info, http_response, response))) {
-  } else if (response->json_type() != ObJsonNodeType::J_ARRAY) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(res = static_cast<ObJsonArray *>(response))) {
-    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObAIFuncUtils::normalize_rerank_result(
+                 allocator, response, document_array->element_count(), res))) {
   } else {
+    // Every document is answered exactly once and the result is globally
+    // ordered by score, so the caller only has to rebase the indexes.
     result_array = res;
   }
   return ret;

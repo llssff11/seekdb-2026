@@ -333,6 +333,17 @@ public:
                                  const share::ObAiModelEndpointInfo &endpoint_info,
                                  ObJsonObject *http_response,
                                  ObIJsonBase *&result);
+  // Validates a dense embedding result: an array of vectors, every vector a
+  // non empty array of finite numbers and all vectors of the same dimension.
+  static int validate_embedding_result(ObIAllocator &allocator, ObIJsonBase *result);
+  // Same as above, and the outer array has to carry expected_count vectors.
+  static int validate_embedding_result(ObIAllocator &allocator, ObIJsonBase *result,
+                                       const int64_t expected_count);
+  // Rewrites a rerank response into the normalized form used by ai_rerank:
+  // every document index exactly once, ordered by score descending and, for
+  // equal scores, by the original document position.
+  static int normalize_rerank_result(ObIAllocator &allocator, ObIJsonBase *result,
+                                     const int64_t expected_count, ObJsonArray *&normalized);
   static int set_string_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res, ObString &res_str);
   static bool is_provider_support_base64(const ObString &provider);
   static int decode_base64_embedding_array(const ObIJsonBase &embedding_jbase, ObIAllocator &allocator,
