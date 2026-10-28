@@ -55,8 +55,14 @@ int ObExprAIEmbed::calc_result_typeN(ObExprResType &type,
   } else {
     types_stack[MODEL_IDX].set_calc_type(ObVarcharType);
     types_stack[MODEL_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
-    types_stack[CONTENT_IDX].set_calc_type(ObVarcharType);
-    types_stack[CONTENT_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+    if (ob_is_string_tc(types_stack[CONTENT_IDX].get_type())) {
+      types_stack[CONTENT_IDX].set_calc_type(ObVarcharType);
+      types_stack[CONTENT_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+    } else {
+      // TEXT / LONGTEXT / BLOB: keep the lob type and read it through the lob
+      // helper while evaluating, its datum carries a lob locator.
+      types_stack[CONTENT_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+    }
     if (param_num == 3) {
       if (ob_is_integer_type(types_stack[DIM_IDX].get_type())) {
         types_stack[DIM_IDX].set_calc_type(ObIntType);
@@ -109,8 +115,12 @@ int ObExprAIEmbed::eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &re
     ObAIFuncExprInfo *info = nullptr;
     share::ObAiModelEndpointInfo resolved_endpoint;
     ObString model_id = arg_model_id->get_string();
-    ObString content = arg_content->get_string();
-    if (model_id.empty() || content.empty()) {
+    ObString content;
+    if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+            ctx.exec_ctx_, temp_allocator, *arg_content,
+            expr.args_[CONTENT_IDX]->datum_meta_,
+            expr.args_[CONTENT_IDX]->obj_meta_.has_lob_header(), content))) {
+    } else if (model_id.empty() || content.empty()) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, model id or input is empty");
       res.set_null();
@@ -166,6 +176,7 @@ int ObExprAIEmbed::eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
                                   : ObDatumVector();
     // Pass 1: mark the batch entries owned by this function and propagate NULL.
     ObArray<int64_t> valid_rows;
+    ObArray<ObString> valid_contents;
     for (int64_t j = 0; OB_SUCC(ret) && j < batch_size; ++j) {
       if (skip.at(j) || eval_flags.at(j)) {
         continue;
@@ -175,14 +186,23 @@ int ObExprAIEmbed::eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
       const ObDatum *content_datum = content_array.at(j);
       if (OB_ISNULL(model_datum) || OB_ISNULL(content_datum)) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (model_datum->is_null() || content_datum->is_null()
-                 || model_datum->get_string().empty() || content_datum->get_string().empty()) {
+      } else if (model_datum->is_null() || content_datum->is_null()) {
         res_datum.at(j)->set_null();
-      } else if (expr.arg_cnt_ == 3 && OB_NOT_NULL(dim_array.at(j))
-                 && !dim_array.at(j)->is_null() && dim_array.at(j)->get_int() <= 0) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, dimension parameter must be a positive integer");
-      } else if (OB_FAIL(valid_rows.push_back(j))) {
+      } else {
+        ObString content;
+        if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+                ctx.exec_ctx_, temp_allocator, *content_datum,
+                expr.args_[CONTENT_IDX]->datum_meta_,
+                expr.args_[CONTENT_IDX]->obj_meta_.has_lob_header(), content))) {
+        } else if (content.empty() || model_datum->get_string().empty()) {
+          res_datum.at(j)->set_null();
+        } else if (expr.arg_cnt_ == 3 && OB_NOT_NULL(dim_array.at(j))
+                   && !dim_array.at(j)->is_null() && dim_array.at(j)->get_int() <= 0) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, dimension parameter must be a positive integer");
+        } else if (OB_FAIL(valid_rows.push_back(j))) {
+        } else if (OB_FAIL(valid_contents.push_back(content))) {
+        }
       }
     }
 
@@ -214,7 +234,7 @@ int ObExprAIEmbed::eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
                                   : 0;
         if (dim_k != group_dim || model_array.at(k)->get_string() != model_id) {
           // another request group
-        } else if (OB_FAIL(contents.push_back(content_array.at(k)->get_string()))) {
+        } else if (OB_FAIL(contents.push_back(valid_contents.at(idx2)))) {
         } else if (OB_FAIL(group_rows.push_back(k))) {
         }
       }
@@ -246,7 +266,7 @@ int ObExprAIEmbed::eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
           results.reset();
           for (int64_t m = 0; OB_SUCC(ret) && m < group_rows.count(); ++m) {
             const int64_t row = group_rows.at(m);
-            ObString row_content = content_array.at(row)->get_string();
+            ObString row_content = contents.at(m);
             ObString single_result;
             if (OB_FAIL(model.call_dense_embedding(row_content, config, single_result))) {
               LOG_WARN("embedding row failed", K(ret), K(row));
