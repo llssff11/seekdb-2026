@@ -243,9 +243,7 @@ int ObExprAIEmbed::eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
           // rows are sent one by one so that the result still maps to its row.
           LOG_WARN("merged embedding request failed, retry row by row",
                    K(merged_ret), "expected", group_rows.count(), "got", results.count());
-          if (OB_NOT_NULL(info)) {
-            results.reset();
-          }
+          results.reset();
           for (int64_t m = 0; OB_SUCC(ret) && m < group_rows.count(); ++m) {
             const int64_t row = group_rows.at(m);
             ObString row_content = content_array.at(row)->get_string();
