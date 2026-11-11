@@ -339,6 +339,17 @@ int ObColumnNamespaceChecker::check_column_exists(const TableItem &table_item, c
         }
       }
     }
+  } else if (table_item.is_file_table()) {
+    // the schema of a file table is the one inferred from the file itself
+    if (OB_ISNULL(table_item.file_table_def_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("file table definition is null", K(ret));
+    } else {
+      const ObIArray<ObString> &col_names = table_item.file_table_def_->col_names_;
+      for (int64_t i = 0; OB_SUCC(ret) && !is_exist && i < col_names.count(); ++i) {
+        is_exist = ObCharset::case_insensitive_equal(col_names.at(i), col_name);
+      }
+    }
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected table type", K_(table_item.type));

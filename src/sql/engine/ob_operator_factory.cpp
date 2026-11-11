@@ -84,6 +84,8 @@
 #include "sql/engine/set/ob_merge_intersect_op.h"
 #include "sql/engine/set/ob_merge_except_op.h"
 #include "sql/engine/basic/ob_expr_values_op.h"
+#include "sql/engine/basic/ob_file_scan_op.h"
+#include "sql/optimizer/ob_log_file_table.h"
 #include "sql/engine/dml/ob_table_delete_op.h"
 #include "sql/engine/dml/ob_table_update_op.h"
 #include "sql/engine/dml/ob_table_lock_op.h"

@@ -1659,6 +1659,12 @@ int ObSelectResolver::expand_target_list(
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(append(column_items, get_stmt()->get_column_items()))) {
     }
+  } else if (table_item.is_file_table()) {
+    // the columns of a file table are the ones inferred from the file
+    if (OB_ISNULL(get_stmt()) || OB_UNLIKELY(get_stmt()->get_column_size() == 0)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(get_stmt()->get_column_items(table_item.table_id_, column_items))) {
+    }
   } else {
     ret = OB_ERR_UNEXPECTED;
   }
@@ -3021,7 +3027,16 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
       ObCollationType file_cs_type = has_cs_type
                                      ? ObCharset::get_default_collation(external_format.csv_format_.cs_type_)
                                      : ObCharset::get_system_collation();
-      if (OB_FAIL(external_format.csv_format_.init_format(ObDataInFileStruct(), 0, file_cs_type))) {
+      // A CSV file is comma separated, while the generic SELECT INTO OUTFILE
+      // defaults to a tab. The DuckDB style COPY expects a real CSV.
+      ObDataInFileStruct csv_file;
+      csv_file.line_term_str_ = ObString::make_string("\n");
+      csv_file.field_term_str_ = ObString::make_string(",");
+      csv_file.field_escaped_str_ = ObString::make_string("\"");
+      csv_file.field_enclosed_str_ = ObString::make_string("\"");
+      csv_file.field_escaped_char_ = '"';
+      csv_file.field_enclosed_char_ = '"';
+      if (OB_FAIL(external_format.csv_format_.init_format(csv_file, 0, file_cs_type))) {
       }
     }
     for (int i = 0; OB_SUCC(ret) && i < format_node->num_child_; ++i) {
@@ -3029,7 +3044,26 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
         ret = OB_ERR_UNEXPECTED;
       } else if (T_EXTERNAL_FILE_FORMAT_TYPE == option_node->type_
                  || T_CHARSET == option_node->type_) {
+      } else if (T_EXTERNAL_FILE_FORMAT_HEADER == option_node->type_
+                 || T_EXTERNAL_FILE_FORMAT_NULLSTR == option_node->type_) {
+        // duckdb style COPY options, resolved right below
       } else if (OB_FAIL(ObResolverUtils::resolve_file_format(option_node, external_format, params_))) {
+      }
+    }
+    for (int i = 0; OB_SUCC(ret) && i < format_node->num_child_; ++i) {
+      if (OB_ISNULL(option_node = format_node->children_[i])) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (T_EXTERNAL_FILE_FORMAT_HEADER == option_node->type_) {
+        into_item.with_header_ = true;
+      } else if (T_EXTERNAL_FILE_FORMAT_NULLSTR == option_node->type_) {
+        if (OB_UNLIKELY(1 != option_node->num_child_ || NULL == option_node->children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid nullstr option", K(ret));
+        } else if (OB_FAIL(ob_write_string(*allocator_,
+                                            ObString(option_node->children_[0]->str_len_,
+                                                     option_node->children_[0]->str_value_),
+                                            into_item.null_str_))) {
+        }
       }
     }
     if (OB_SUCC(ret)

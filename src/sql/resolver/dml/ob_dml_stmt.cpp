@@ -158,6 +158,47 @@ int TableItem::deep_copy_json_table_def(const ObJsonTableDef& jt_def, ObIRawExpr
   return ret;
 }
 
+int TableItem::deep_copy_file_table_def(const ObFileTableDef& file_def, ObIAllocator* allocator)
+{
+  int ret = OB_SUCCESS;
+  ObFileTableDef* tmp_def = NULL;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(tmp_def = static_cast<ObFileTableDef*>(allocator->alloc(sizeof(ObFileTableDef))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    tmp_def = new (tmp_def) ObFileTableDef();
+    if (OB_FAIL(tmp_def->deep_copy(file_def, allocator))) {
+    } else {
+      file_table_def_ = tmp_def;
+    }
+  }
+  return ret;
+}
+
+int ObFileTableDef::deep_copy(const ObFileTableDef &other, ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  format_ = other.format_;
+  has_header_ = other.has_header_;
+  field_delim_ = other.field_delim_;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ob_write_string(*allocator, other.path_, path_))) {
+  } else if (OB_FAIL(ob_write_string(*allocator, other.null_str_, null_str_))) {
+  } else if (OB_FAIL(col_types_.assign(other.col_types_))) {
+  } else if (OB_FAIL(col_nullables_.assign(other.col_nullables_))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < other.col_names_.count(); ++i) {
+      ObString name;
+      if (OB_FAIL(ob_write_string(*allocator, other.col_names_.at(i), name))) {
+      } else if (OB_FAIL(col_names_.push_back(name))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
                          const TableItem &other,
                          ObIAllocator* allocator)
@@ -188,6 +229,8 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   SampleInfo *buf = NULL;
   if (is_json_table() 
       && OB_FAIL(deep_copy_json_table_def(*other.json_table_def_, expr_copier, allocator))) {
+  } else if (is_file_table()
+      && OB_FAIL(deep_copy_file_table_def(*other.file_table_def_, allocator))) {
   } else if (OB_FAIL(expr_copier.copy(other.snapshot_query_expr_, snapshot_query_expr_))) {
   } else if (OB_FAIL(expr_copier.copy(other.function_table_expr_, function_table_expr_))) {
   } else if (OB_FAIL(part_ids_.assign(other.part_ids_))) {
@@ -1557,6 +1600,7 @@ int ObDMLStmt::formalize_stmt_expr_reference(ObRawExprFactory *expr_factory,
         ret = OB_ERR_UNEXPECTED;
       } else if (table_item->is_function_table() ||
                  table_item->is_json_table() ||
+                 table_item->is_file_table() ||
                  table_item->for_update_ ||
                  table_item->is_values_table()) {
         if (OB_FAIL(set_sharable_expr_reference(*column_item.expr_, ExplicitedRefType::REF_BY_NORMAL))) {

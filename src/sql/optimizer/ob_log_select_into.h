@@ -44,7 +44,9 @@ public:
         escaped_cht_(),
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
-        external_properties_()
+        external_properties_(),
+        with_header_(false),
+        column_names_()
   {
   }
   virtual ~ObLogSelectInto() {}
@@ -164,6 +166,13 @@ public:
   {
     return external_properties_;
   }
+  inline void set_with_header(const bool with_header) { with_header_ = with_header; }
+  inline bool get_with_header() const { return with_header_; }
+  inline int set_column_names(const common::ObIArray<common::ObString> &names)
+  {
+    return column_names_.assign(names);
+  }
+  inline const common::ObIArray<common::ObString> &get_column_names() const { return column_names_; }
   const common::ObIArray<ObRawExpr*> &get_select_exprs() const { return select_exprs_; }
   common::ObIArray<ObRawExpr*> &get_select_exprs() { return select_exprs_; }
   virtual int est_cost() override;
@@ -188,6 +197,9 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  // duckdb style COPY: write a header line built from the output column names
+  bool with_header_;
+  common::ObSEArray<common::ObString, 16, common::ModulePageAllocator, true> column_names_;
 };
 }
 }

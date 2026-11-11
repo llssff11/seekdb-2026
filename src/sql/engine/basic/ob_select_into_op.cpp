@@ -20,6 +20,7 @@
 #include <memory>
 
 #include "ob_select_into_op.h"
+#include "lib/string/ob_sql_string.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
 #include "lib/charset/ob_charset_string_helper.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
@@ -38,7 +39,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, with_header_, column_names_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -1244,7 +1245,34 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
   } else if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_ && MY_SPEC.buffer_size_ > 0) {
     csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
     if (OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
+    } else if (MY_SPEC.with_header_ && T_INTO_OUTFILE == MY_SPEC.into_type_
+               && OB_FAIL(write_csv_header(csv_data_writer))) {
+      LOG_WARN("failed to write csv header", K(ret));
     }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::write_csv_header(ObCsvFileWriter *csv_writer)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString header;
+  if (OB_ISNULL(csv_writer)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("csv writer is null", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_names_.count(); ++i) {
+    if (i > 0 && OB_FAIL(header.append(field_str_.get_string()))) {
+    } else if (OB_FAIL(header.append(MY_SPEC.column_names_.at(i)))) {
+      LOG_WARN("failed to append column name", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(header.append(line_str_.get_string()))) {
+    LOG_WARN("failed to append line terminator", K(ret));
+  }
+  if (OB_SUCC(ret) && header.length() > 0
+      && OB_FAIL(csv_writer->flush_data(header.ptr(), header.length()))) {
+    LOG_WARN("failed to flush csv header", K(ret));
   }
   return ret;
 }

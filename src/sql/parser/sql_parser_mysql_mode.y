@@ -245,6 +245,7 @@ END_P SET_VAR DELIMITER
         PARTITION PRECISION PRIMARY PROCEDURE PURGE
         RANGE READ READS READ_WRITE REAL REFERENCES REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE
         RESIGNAL RESTRICT RETURN REVOKE RIGHT RLIKE
+        READ_CSV READ_JSON READ_PARQUET GLOB_FILE
         SCHEMA SCHEMAS SECOND_MICROSECOND SELECT SENSITIVE SEPARATOR SET SHOW SIGNAL SMALLINT SPATIAL
         SPECIFIC SQL SQLEXCEPTION SQLSTATE SQLWARNING SQL_BIG_RESULT SQL_CALC_FOUND_ROWS
         SQL_SMALL_RESULT SSL SKIP STARTING STORED STRAIGHT_JOIN
@@ -289,7 +290,7 @@ END_P SET_VAR DELIMITER
         FOUND FORK FREEZE FREQUENCY FUNCTION FOLLOWING FLASHBACK FULL FRAGMENTATION FROZEN FILE_ID FILTER
         FIELD_OPTIONALLY_ENCLOSED_BY FIELD_DELIMITER FIELD_ENCLOSED_BY FILE_EXTENSION
 
-        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING
+        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING HEADER
         GLOBAL_ALIAS
 
         HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
@@ -317,7 +318,7 @@ END_P SET_VAR DELIMITER
         MYSQL_ERRNO MAXIMIZE MEMBER MINVALUE MY_NAME
 
         NAME NAMES NAMESPACE NATIONAL NCHAR NDB NDBCLUSTER NESTED NEW NEXT NO NOAUDIT NONE NORMAL NOW NOWAIT NEVER NGRAM_TOKEN_SIZE
-        NO_WAIT NULLS NUMBER NVARCHAR NTILE NTH_VALUE NETWORK NOPARALLEL
+        NO_WAIT NULLS NUMBER NVARCHAR NTILE NTH_VALUE NETWORK NOPARALLEL NULLSTR
         NULL_IF_EXETERNAL
 
         OBSOLETE OBJECT OCCUR OF OFF OFFSET OLD OLD_PASSWORD ONE ONE_SHOT ONLY OPEN OPTIONS ORDINALITY OURS OLD_KEY OVER
@@ -470,6 +471,7 @@ END_P SET_VAR DELIMITER
 %type <node> cache_type
 %type <node> into_opt into_clause field_opt field_term field_term_list line_opt line_term line_term_list into_var_list into_var file_opt file_option_list file_option file_size_const binary_format
 %type <node> string_list text_string string_val_list
+%type <node> copy_stmt copy_options copy_option_list copy_option
 %type <node> list_expr list_partition_element list_partition_expr list_partition_list list_partition_option opt_list_partition_list opt_list_subpartition_list list_subpartition_list list_subpartition_element drop_partition_name_list
 %type <node> distribute_method distribute_method_list opt_distribute_method_list
 %type <node> load_data_stmt opt_load_local opt_duplicate opt_compression opt_load_charset opt_load_ignore_rows infile_string
@@ -498,6 +500,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_table_expr file_table_params file_table_param_list file_table_param file_table_func_name
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -582,6 +585,7 @@ stmt:
   | drop_table_stmt         { $$ = $1; check_question_mark($$, result); }
   | drop_view_stmt          { $$ = $1; check_question_mark($$, result); }
   | explain_stmt            { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | create_outline_stmt     { $$ = $1; question_mark_issue($$, result); }
   | alter_outline_stmt      { $$ = $1; question_mark_issue($$, result); }
   | drop_outline_stmt       { $$ = $1; check_question_mark($$, result); }
@@ -8903,6 +8907,68 @@ LIMIT limit_expr OFFSET limit_expr
 }
 ;
 
+// DuckDB style COPY statement:
+//   COPY (query) TO 'file' (format csv, header, nullstr 'NULL')
+// It is rewritten into the equivalent SELECT ... INTO OUTFILE form so that the
+// existing resolver / optimizer / executor path is reused unchanged.
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE copy_options
+{
+  ParseNode *into_node = NULL;
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $6, $7, NULL);
+  $$ = $3;
+  if (NULL == $$) {
+    yyerror(&@1, result, "invalid COPY statement");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+  }
+}
+;
+
+copy_options:
+/*empty*/
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  merge_nodes($$, result, T_EXTERNAL_FILE_FORMAT, $2);
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+FORMAT opt_equal_mark NAME_OB
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $3);
+}
+| FORMAT opt_equal_mark STRING_VALUE
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $3);
+}
+| HEADER
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_HEADER);
+}
+| NULLSTR STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_NULLSTR, 1, $2);
+}
+;
+
 into_clause:
 INTO OUTFILE STRING_VALUE opt_charset field_opt line_opt file_opt
 {
@@ -10832,6 +10898,10 @@ tbl_name
   $$->value_ = 1; //lateral
 }
 | json_table_expr
+{
+  $$ = $1;
+}
+| file_table_expr
 {
   $$ = $1;
 }
@@ -16621,6 +16691,89 @@ DAY
 
 /*===========================================================
 *
+*  FILE TABLE (read_csv / read_json / read_parquet / glob)
+*============================================================*/
+
+file_table_expr:
+file_table_func_name '(' literal file_table_params ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 4, $1, $3, $4, NULL);
+}
+| file_table_func_name '(' literal file_table_params ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 4, $1, $3, $4, $6);
+}
+| file_table_func_name '(' literal file_table_params ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 4, $1, $3, $4, $7);
+}
+;
+
+file_table_func_name:
+READ_CSV
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 0; /* csv */
+}
+| READ_JSON
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 1; /* json */
+}
+| READ_PARQUET
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 2; /* parquet */
+}
+| GLOB_FILE
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 3; /* glob */
+}
+;
+
+file_table_params:
+{
+  $$ = NULL;
+}
+| ',' file_table_param_list
+{
+  merge_nodes($$, result, T_EXPR_LIST, $2);
+}
+;
+
+file_table_param_list:
+file_table_param
+{
+  $$ = $1;
+}
+| file_table_param_list ',' file_table_param
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+file_table_param:
+literal
+{
+  /* positional argument, only the format may be given this way */
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_PARAM, 2, NULL, $1);
+}
+| column_name COMP_EQ literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_PARAM, 2, $1, $3);
+}
+| column_name COMP_EQ '-' INTNUM
+{
+  ParseNode *neg_node = NULL;
+  malloc_terminal_node(neg_node, result->malloc_pool_, T_INT);
+  neg_node->value_ = -$4->value_;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_PARAM, 2, $1, neg_node);
+}
+;
+
+/*===========================================================
+*
 *  JSON TABLE
 *============================================================*/
 
@@ -17713,6 +17866,7 @@ ACCOUNT
 |       GLOBAL %prec LOWER_PARENS
 |       GRANTS
 |       GROUPING
+|       HEADER
 |       GROUP_CONCAT
 |       HASH
 |       HEAP
@@ -17864,6 +18018,7 @@ ACCOUNT
 |       NTILE
 |       NTH_VALUE
 |       NUMBER
+|       NULLSTR
 |       NULL_IF_EXETERNAL
 |       NULLS
 |       NVARCHAR

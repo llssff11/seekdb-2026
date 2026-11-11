@@ -71,7 +71,9 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      with_header_(false),
+      column_names_(alloc)
   {
   }
 
@@ -91,6 +93,9 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  // duckdb style COPY: write a header line built from the output column names
+  bool with_header_;
+  common::ObFixedArray<common::ObString, common::ObIAllocator> column_names_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -254,6 +259,7 @@ private:
   int calc_outfile_path();
   int create_shared_buffer_for_data_writer();
   int create_the_only_data_writer(ObExternalFileWriter *&data_writer);
+  int write_csv_header(ObCsvFileWriter *csv_writer);
   int new_data_writer(ObExternalFileWriter *&data_writer);
   int check_secure_file_path(ObString file_name);
   char *get_json_buf() { return json_buf_; }

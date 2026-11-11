@@ -32,6 +32,8 @@ namespace sql
     {}
     virtual ~ObExplainResolver() {}
     virtual int resolve(const ParseNode &parse_tree);
+    // DESCRIBE of a statement over a file table reports the inferred file schema.
+    int try_resolve_file_describe(const ParseNode &child_node, bool &handled);
     ObExplainStmt *get_explain_stmt();
     int resolve_columns(ObRawExpr *&expr, common::ObArray<ObQualifiedName> &columns)
     {
