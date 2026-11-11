@@ -41,6 +41,14 @@ const char *VALID_PROVIDERS[] = {
   "OLLAMA"
 };
 
+// the ollama model service does not need the access key
+static const char *OLLAMA_PROVIDER = "OLLAMA";
+
+static bool is_ollama_provider(const ObString &provider)
+{
+  return !provider.empty() && provider.case_compare(OLLAMA_PROVIDER) == 0;
+}
+
 #define EXTRACT_JSON_ELEM_STR(json_key, member) \
   EXTRACT_JSON_ELEM_STR_WITH_PROCESS(json_key, member, "void")
 
@@ -113,17 +121,16 @@ int ObAiModelEndpointInfo::check_valid() const
   } else if (url_.empty()) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("url"), "url");
+  } else if (access_key_.empty() && !is_ollama_provider(provider_)) {
+    ret = OB_AI_FUNC_PARAM_EMPTY;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
+    LOG_WARN("access_key is empty", K(ret), K(*this));
   } else if (provider_.empty()) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("provider"), "provider");
   } else if (!is_valid_provider(provider_)) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("provider"), "provider");
-  } else if (provider_need_access_key(provider_) && access_key_.empty()) {
-    // Local deployment providers (e.g. OLLAMA) do not require an api key.
-    ret = OB_AI_FUNC_PARAM_EMPTY;
-    LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
-    LOG_WARN("access_key is empty", K(ret), K(*this));
   } else if (!parameters_.empty()) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("parameters"), "parameters");
@@ -149,20 +156,11 @@ bool ObAiModelEndpointInfo::is_valid_provider(const ObString &provider)
   return is_valid;
 }
 
-bool ObAiModelEndpointInfo::provider_need_access_key(const ObString &provider)
-{
-  // Providers deployed inside the user's own network are usually open without
-  // an api key. Keep the whitelist here so that adding a new local provider is
-  // a one-line change.
-  return provider.case_compare("OLLAMA") != 0;
-}
-
 int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &allocator, const ObIJsonBase &delta_jbase)
 {
   int ret = OB_SUCCESS;
   JsonObjectIterator iter = delta_jbase.object_iterator();
   bool has_api_key = false;
-  const ObString old_provider = provider_;
   while (!iter.end() && OB_SUCC(ret)) {
     ObJsonObjPair elem;
     if (OB_FAIL(iter.get_elem(elem))) {
@@ -182,16 +180,7 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
   }
 
   if (OB_SUCC(ret)) {
-    if (!old_provider.empty() && !provider_.empty()
-        && old_provider.case_compare(provider_) != 0
-        && (!provider_need_access_key(old_provider) != !provider_need_access_key(provider_))) {
-      // An endpoint created for a local provider carries no credential, moving
-      // it to a provider that requires one would leave a broken endpoint.
-      ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
-      LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("provider"), "provider");
-      LOG_WARN("provider can not be switched between local and remote provider",
-               K(ret), K(old_provider), K(provider_));
-    } else if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
+    if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
       LOG_WARN("failed to encrypt access key", K(ret));
     } else if (OB_FAIL(check_valid())) {
     }

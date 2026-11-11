@@ -90,8 +90,7 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
   ObDatum *arg_model_id = nullptr;
   ObDatum *arg_prompt = nullptr;
   ObDatum *arg_config = nullptr;
-  if (expr.arg_cnt_ == 3 ? OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_prompt, arg_config))
-                         : OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_prompt))) {
+  if (OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_prompt, arg_config))) {
   } else if (arg_model_id->is_null() || arg_prompt->is_null()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, parameters is null");
@@ -118,10 +117,6 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
       ObJsonObject *prompt_object = nullptr;
       bool is_null = false;
       if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, PROMPT_IDX, j_base, is_null))) {
-      } else if (is_null || OB_ISNULL(j_base)) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, prompt is null");
-        res.set_null();
       } else if (j_base->json_type() != ObJsonNodeType::J_OBJECT) {
         ret = OB_INVALID_ARGUMENT;
       } else if (OB_FALSE_IT(prompt_object = static_cast<ObJsonObject *>(j_base))) {
@@ -136,9 +131,8 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
 
     if (OB_FAIL(ret)) {
     } else if (OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
+      // the config is optional, the null config means the default config of the model is used
       if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
-      } else if (config_str.empty()) {
-        // A NULL / empty config means "use the default request parameters".
       } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
       }
     }

@@ -55,21 +55,13 @@ private:
                                          common::ObString &doc_key, const common::ObAIFuncExprInfo &info, const share::ObAiModelEndpointInfo &endpoint_info, ObDatum &res);
   static int get_doc_array_from_documents_array_with_key(ObIAllocator &allocator, ObJsonArray *document_object_array, ObString &doc_key, ObJsonArray *&doc_array);
   static int sort_document_array_by_model_result(common::ObIAllocator &allocator, common::ObJsonArray *document_array, common::ObJsonArray *model_result_array, common::ObJsonArray *&sorted_document_array);
+  static int sort_json_array_by_score(common::ObIAllocator &allocator, common::ObJsonArray *array, common::ObString &score_key, common::ObJsonArray *&sorted_array);
+  static int get_json_int_value(common::ObJsonNode *node, int64_t &value);
+  static int get_json_double_value(common::ObJsonNode *node, double &value);
   static int construct_config_json(common::ObIAllocator &allocator, int64_t top_k, int64_t return_doc, common::ObJsonObject *&config_json);
   static int construct_batch_document_array(common::ObIAllocator &allocator, common::ObJsonArray *document_array, int64_t start_idx, int64_t end_idx, common::ObJsonArray *&batch_document_array);
-  static int batch_result_add_base(common::ObIAllocator &allocator, common::ObJsonArray *array, int64_t start_idx, int64_t batch_count);
+  static int batch_result_add_base(common::ObIAllocator &allocator, common::ObJsonArray *array, int64_t start_idx);
   static int compact_json_array_by_key(common::ObIAllocator &allocator, common::ObJsonArray *array1, common::ObJsonArray *array2, common::ObString &score_key, common::ObJsonArray *&compact_array);
-  // Splits the documents into batches, sends one request per batch and maps the
-  // per batch index back to the index of the original document.
-  static int call_rerank_in_batches(common::ObIAllocator &allocator,
-                                    const common::ObAIFuncExprInfo &info,
-                                    const share::ObAiModelEndpointInfo &endpoint_info,
-                                    common::ObArray<common::ObString> &header_array,
-                                    common::ObString &query,
-                                    common::ObJsonArray *document_array,
-                                    common::ObJsonArray *&result_array);
-  static int get_score_value(common::ObJsonNode *score_node, double &score);
-  static constexpr int64_t RERANK_BATCH_SIZE = 20;
   static constexpr int MODEL_IDX = 0;
   static constexpr int QUERY_IDX = 1;
   static constexpr int DOCUMENTS_IDX = 2;
