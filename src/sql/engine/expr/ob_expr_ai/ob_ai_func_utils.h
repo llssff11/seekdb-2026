@@ -20,9 +20,26 @@
 #include "ob_ai_func.h"
 #include "share/json/ob_json_helper.h"
 #include "lib/encode/ob_base64_encode.h"
+#include "lib/hash_func/murmur_hash.h"
+#include "lib/lock/ob_spin_lock.h"
+#include "lib/container/ob_array.h"
 
 namespace oceanbase 
 {
+namespace share 
+{
+/**
+ * @brief Static configuration of one ai model, such as the max batch size and
+ *        the max size of one image which can be sent to the model service.
+ */
+struct ObAIModelConfigItem
+{
+  ObAIModelConfigItem() : batch_size_(0), max_image_size_(0) {}
+  int64_t batch_size_;
+  int64_t max_image_size_;
+};
+} // namespace share
+
 namespace common 
 {
 
@@ -66,6 +83,13 @@ public:
                          common::ObArray<ObString> &contents,
                          common::ObJsonObject *config,
                          common::ObJsonObject *&body) override;
+    // the same as the above one, but the caller can specify the type of the input content
+    int get_body(common::ObIAllocator &allocator,
+                 common::ObString &model,
+                 common::ObArray<ObString> &contents,
+                 common::ObJsonObject *config,
+                 common::ObString &input_type,
+                 common::ObJsonObject *&body);
     virtual int parse_output(common::ObIAllocator &allocator,
                              common::ObJsonObject *http_response,
                              common::ObIJsonBase *&result) override;
@@ -242,7 +266,8 @@ public:
   static int get_json_string(ObIAllocator &allocator, ObString &str, ObJsonString *&str_node);
   static int get_json_int(ObIAllocator &allocator, int64_t num, ObJsonInt *&int_node);
   static int get_json_boolean(ObIAllocator &allocator, bool value, ObJsonBoolean *&boolean_node);
-  static int get_json_object_form_str(ObIAllocator &allocator, ObString &str, ObJsonObject *&obj_node);
+  static int get_json_object_form_str(ObIAllocator &allocator, const ObString &str, ObJsonObject *&obj_node);
+  static int get_json_array_form_str(ObIAllocator &allocator, const ObString &str, ObJsonArray *&array_node);
   static int print_json_to_str(ObIAllocator &allocator, ObIJsonBase *base_node, ObString &str);
   static int compact_json_object(ObIAllocator &allocator, ObJsonObject *obj_node, ObJsonObject *compact_obj);
 private:
@@ -371,16 +396,149 @@ public:
    DISALLOW_COPY_AND_ASSIGN(ObAIFuncModel);
 };
 
+/**
+ * @brief Utils to detect the type of one image binary content and to encode it.
+ */
+class ObAiFuncImageUtils
+{
+public:
+  enum ObImageType
+  {
+    IMAGE_TYPE_JPEG = 0,
+    IMAGE_TYPE_PNG,
+    IMAGE_TYPE_GIF,
+    IMAGE_TYPE_WEBP,
+    IMAGE_TYPE_BMP,
+    IMAGE_TYPE_TIFF,
+    IMAGE_TYPE_ICO,
+    IMAGE_TYPE_DIB,
+    IMAGE_TYPE_ICNS,
+    IMAGE_TYPE_SGI,
+    IMAGE_TYPE_UNKNOWN
+  };
+  ObAiFuncImageUtils() {}
+  virtual ~ObAiFuncImageUtils() {}
+  static int get_type_from_binary(ObIAllocator &allocator, const ObString &binary_image_str, ObImageType &image_type);
+  static int get_base64_data_uri_from_binary(ObIAllocator &allocator, const ObString &binary_image_str, ObString &base64_data_uri);
+  static const char *get_image_type_str(ObImageType image_type);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObAiFuncImageUtils);
+};
+
+/**
+ * @brief The key of one ai model config, the provider name and the model name
+ *        are both compared case insensitively.
+ */
+class ObAIModelConfigKey
+{
+public:
+  ObAIModelConfigKey() {}
+  explicit ObAIModelConfigKey(const ObString &provider, const ObString &model_name)
+    : provider_(provider), model_name_(model_name) {}
+  virtual ~ObAIModelConfigKey() {}
+  uint64_t hash() const
+  {
+    uint64_t hash_value = 0;
+    if (!provider_.empty()) {
+      hash_value = murmurhash(provider_.ptr(), static_cast<int32_t>(provider_.length()), 0);
+    }
+    if (!model_name_.empty()) {
+      hash_value = murmurhash(model_name_.ptr(), static_cast<int32_t>(model_name_.length()), hash_value);
+    }
+    return hash_value;
+  }
+  bool operator==(const ObAIModelConfigKey &other) const
+  {
+    return provider_.case_compare(other.provider_) == 0
+           && model_name_.case_compare(other.model_name_) == 0;
+  }
+  ObString provider_;
+  ObString model_name_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObAIModelConfigKey);
+};
+
+/**
+ * @brief The manager of the static ai model configs. It holds the well known
+ *        configs of the model services, such as the max batch size and the max
+ *        image size of the embedding models.
+ */
+class ObAIModelConfigInfoManager
+{
+public:
+  ObAIModelConfigInfoManager();
+  virtual ~ObAIModelConfigInfoManager();
+  static ObAIModelConfigInfoManager &get_instance();
+  int init();
+  void reset();
+  bool is_inited() const { return is_inited_; }
+  int get_model_config(const ObString &provider,
+                       const ObString &request_model_name,
+                       share::ObAIModelConfigItem &item);
+  int get_config(const ObString &provider,
+                 const ObString &model_name,
+                 share::ObAIModelConfigItem &item);
+  int set_config(const ObString &provider,
+                 const ObString &model_name,
+                 const share::ObAIModelConfigItem &item,
+                 const bool overwrite = true);
+  int64_t size() const { return config_array_.count(); }
+private:
+  int register_default_model_configs_();
+  // the following functions must be called with the lock held
+  int init_locked_();
+  int set_config_locked_(const ObString &provider,
+                         const ObString &model_name,
+                         const share::ObAIModelConfigItem &item,
+                         const bool overwrite = false);
+  struct ModelConfigEntry
+  {
+    ModelConfigEntry() { provider_[0] = '\0'; model_name_[0] = '\0'; }
+    char provider_[64];
+    char model_name_[128];
+    share::ObAIModelConfigItem item_;
+  };
+  common::ObSEArray<ModelConfigEntry, 16> config_array_;
+  common::ObSpinLock lock_;
+  bool is_inited_;
+  DISALLOW_COPY_AND_ASSIGN(ObAIModelConfigInfoManager);
+};
+
 class ObAIFuncPromptObjectUtils
 {
 public:
+  enum class PromptArgType : int8_t
+  {
+    TEXT = 0,
+    IMAGE = 1,
+    UNKNOWN = 2
+  };
+  enum class ImageArgType : int8_t
+  {
+    URL = 0,
+    BINARY = 1
+  };
   ObAIFuncPromptObjectUtils() {}
   virtual ~ObAIFuncPromptObjectUtils() {}
   static bool is_valid_prompt_object(ObJsonObject* prompt_object);
   static int replace_all_str_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str);
   static int construct_prompt_object(ObIAllocator &allocator, ObString &template_str, ObJsonArray *args_array, ObJsonObject *&prompt_object);
+  // parse the type of every argument which is referenced by the template
+  static int parse_template_arg_types(const ObString &template_str,
+                                      const int64_t arg_cnt,
+                                      ObIArray<PromptArgType> &arg_types,
+                                      bool *has_image = nullptr);
+  // build the image argument object which is described by the openai compatible protocol
+  static int build_image_arg_object(ObIAllocator &allocator,
+                                    const ObString &arg_str,
+                                    const ImageArgType image_arg_type,
+                                    ObJsonObject *&image_obj);
+  // check the size of every binary image argument
+  static int validate_binary_image_sizes(ObJsonObject *prompt_object, const int64_t max_image_size);
   static constexpr char prompt_template_key[20] = "template";
   static constexpr char prompt_args_key[20] = "args";
+  static constexpr char HTTP_PREFIX[8] = "http://";
+  static constexpr char HTTPS_PREFIX[9] = "https://";
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncPromptObjectUtils);
 };
