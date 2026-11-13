@@ -21,6 +21,8 @@
 #include "lib/charset/ob_charset.h"
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_tree.h"
+#include "common/json_type/ob_json_bin.h"
+#include "lib/utility/serialization.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
@@ -106,6 +108,125 @@ int init_parse_helper_with_default_property(storage::ObFTParseHelper &helper,
   return ret;
 }
 
+// Encode the DEFAULT-mode TOKENIZE result (a JSON array of token strings)
+// straight into its binary JSON representation.  The output is byte-identical
+// to what ObFTParseHelper::make_token_array_json + ObJsonBinSerializer produce
+// (document header v0, array node header, var-width count/size, value entries
+// and string payloads), but it skips materializing the ObJsonTree nodes and
+// re-walking them during serialization.
+static int make_token_array_bin(const storage::ObFTWordMap &words,
+                                common::ObIAllocator &allocator,
+                                common::ObString &result)
+{
+  using namespace common;
+  int ret = OB_SUCCESS;
+  const uint64_t cnt = words.size();
+
+  // Pass 1: per-string serialize size (ObJsonString::get_serialize_size =
+  // vertype byte + vi64 length + payload).
+  uint64_t node_total_size = 0;
+  uint64_t last_node_size = 0;
+  for (storage::ObFTWordMap::const_iterator it = words.begin(); it != words.end(); ++it) {
+    const int64_t len = it->first.get_word().get_string().length();
+    last_node_size = sizeof(uint8_t) + serialization::encoded_length_vi64(len) + len;
+    node_total_size += last_node_size;
+  }
+
+  // Estimated node size, replicating ObJsonArray::update_serialize_size():
+  // it decides the obj-size/entry var-width recorded in the array header.
+  const uint8_t count_var_type = ObJsonVar::get_var_type(cnt);
+  const uint64_t count_size = ObJsonVar::get_var_size(count_var_type);
+  const uint64_t est_total = OB_JSON_BIN_OBJ_HEADER_LEN + count_size + sizeof(uint32_t)
+      + (sizeof(uint32_t) + sizeof(uint8_t)) * cnt + node_total_size;
+  const uint64_t last_offset = est_total - last_node_size;
+  const uint8_t off_var_type = ObJsonVar::get_var_type(last_offset);
+  const uint64_t total_off = (ObJsonVar::get_var_size(off_var_type) + sizeof(uint8_t)) * cnt;
+  const uint64_t est_total2 = OB_JSON_BIN_OBJ_HEADER_LEN + count_size + sizeof(uint32_t)
+      + total_off + node_total_size;
+  const uint8_t size_var_type = ObJsonVar::get_var_type(est_total2);
+  const uint64_t obj_size_est = OB_JSON_BIN_OBJ_HEADER_LEN + count_size
+      + ObJsonVar::get_var_size(size_var_type) + total_off + node_total_size;
+
+  // Resolve the header var-widths to a fixed point: widen them if the real
+  // size ever needs more bits than the estimate reserved (mirrors the
+  // reserialize step of the tree path).
+  uint8_t obj_size_var_type = ObJsonVar::get_var_type(obj_size_est);
+  uint64_t entries_off = 0;
+  uint64_t data_off = 0;
+  uint64_t obj_size_real = 0;
+  bool resolved = false;
+  for (int round = 0; OB_SUCC(ret) && !resolved && round < 5; ++round) {
+    const uint64_t entry_size = ObJsonVar::get_var_size(obj_size_var_type);
+    entries_off = OB_JSON_BIN_OBJ_HEADER_LEN + count_size
+        + ObJsonVar::get_var_size(obj_size_var_type);
+    data_off = entries_off + cnt * (entry_size + OB_JSON_BIN_VALUE_TYPE_LEN);
+    obj_size_real = data_off + node_total_size;
+    if (ObJsonVar::get_var_type(obj_size_real) <= obj_size_var_type) {
+      resolved = true;
+    } else {
+      obj_size_var_type = ObJsonVar::get_var_type(obj_size_real);
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(!resolved)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tokenize bin encode cannot settle entry var type",
+             K(cnt), K(obj_size_est), K(obj_size_real));
+  } else {
+    const uint64_t entry_size = ObJsonVar::get_var_size(obj_size_var_type);
+    const int64_t node_start = static_cast<int64_t>(sizeof(ObJsonBinDocHeader));
+    const int64_t total_len = node_start + static_cast<int64_t>(obj_size_real);
+    char *buf = static_cast<char *>(allocator.alloc(total_len));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMSET(buf, 0, total_len);
+      // document header (v0): extend_seg_offset is back-filled with the total
+      // length, exactly like ObJsonBinSerializer::serialize does at the end.
+      ObJsonBinDocHeader *doc = reinterpret_cast<ObJsonBinDocHeader *>(buf);
+      doc->type_ = J_DOC_HEADER_V0;
+      doc->use_lexicographical_order_ = 0;
+      doc->reserved_ = 0;
+      doc->extend_seg_offset_ = static_cast<uint64_t>(total_len);
+      // array node header
+      ObJsonBinHeader *hdr = reinterpret_cast<ObJsonBinHeader *>(buf + node_start);
+      hdr->type_ = J_ARRAY_V0;
+      hdr->entry_size_ = obj_size_var_type;
+      hdr->count_size_ = count_var_type;
+      hdr->obj_size_size_ = obj_size_var_type;
+      hdr->is_continuous_ = 1;
+      hdr->reserved_ = 0;
+      // element count and object size
+      ObJsonVar::set_var(cnt, count_var_type, buf + node_start + OB_JSON_BIN_OBJ_HEADER_LEN);
+      ObJsonVar::set_var(obj_size_real, obj_size_var_type,
+                         buf + node_start + OB_JSON_BIN_OBJ_HEADER_LEN + count_size);
+      // value entries followed by the string payloads
+      uint64_t cur = data_off;
+      uint64_t idx = 0;
+      for (storage::ObFTWordMap::const_iterator it = words.begin(); OB_SUCC(ret) && it != words.end();
+           ++it, ++idx) {
+        const ObString &word = it->first.get_word().get_string();
+        const int64_t entry_pos = node_start
+            + static_cast<int64_t>(entries_off) + static_cast<int64_t>(idx) * (entry_size + 1);
+        ObJsonVar::set_var(cur, obj_size_var_type, buf + entry_pos);
+        *(reinterpret_cast<uint8_t *>(buf + entry_pos + entry_size)) = J_STRING_V0;
+        *(reinterpret_cast<uint8_t *>(buf + node_start + cur)) = J_STRING_V0;
+        int64_t pos = node_start + static_cast<int64_t>(cur) + 1;
+        if (OB_FAIL(serialization::encode_vi64(buf, total_len, pos, word.length()))) {
+        } else {
+          MEMCPY(buf + pos, word.ptr(), word.length());
+          pos += word.length();
+          cur += static_cast<uint64_t>(pos - (node_start + static_cast<int64_t>(cur)));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        result.assign_ptr(buf, static_cast<int32_t>(total_len));
+      }
+    }
+  }
+  return ret;
+}
+
 }  // namespace
 
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
@@ -126,19 +247,52 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
 
-  ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (TokenizeParam::OUTPUT_MODE::DEFAULT == param.output_mode_) {
+    // Fast path: the default output is a plain array of token strings, so the
+    // binary JSON result is encoded directly from the word map, skipping the
+    // ObJsonTree build and its re-serialization.
+    storage::ObFTParseHelper tokenize_helper;
+    const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
+    int64_t doc_len = 0;
+    storage::ObFTWordMap token_map;
+    if (OB_FAIL(param.properties_.empty()
+                    ? init_parse_helper_with_default_property(tokenize_helper,
+                                                              temp_allocator,
+                                                              param.parser_name_)
+                    : tokenize_helper.init(&temp_allocator,
+                                           param.parser_name_,
+                                           param.properties_))) {
+    } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+    } else if ((0 != param.fulltext_.length())
+               && OB_FAIL(tokenize_helper.segment(param.meta_,
+                                                  param.fulltext_.ptr(),
+                                                  param.fulltext_.length(),
+                                                  doc_len,
+                                                  token_map))) {
+    } else {
+      common::ObString bin_str;
+      if (OB_FAIL(make_token_array_bin(token_map, temp_allocator, bin_str))) {
+      } else {
+        if (OB_SUCC(ret)
+            && OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, bin_str))) {
+        }
+      }
+    }
+  } else {
+    ObIJsonBase *json_result = nullptr;
+    if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                       ctx,
+                                                       temp_allocator,
+                                                       json_result,
+                                                       expr_datum))) {
+    }
   }
 
   return ret;

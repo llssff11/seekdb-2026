@@ -37,11 +37,12 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
   int ret = OB_SUCCESS;
 
   if (ObFTCharUtil::CharType::USELESS != type) {
-    // handle previous hits_ first and then check from this char
-    for (ObList<ObDATrieHit, ObIAllocator>::iterator iter = hits_.begin();
-         OB_SUCC(ret) && iter != hits_.end();
-         iter++) {
-      ObDATrieHit &hit = *iter;
+    // handle the pending hits first and then check from this char.  The entries
+    // that are still alive are compacted in place, so the ones that turned out
+    // to be unmatched are dropped without touching the allocator.
+    int64_t kept = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < hits_cnt_; ++i) {
+      ObDATrieHit &hit = hits_[i];
       if (OB_FAIL(dict_main_.match_with_hit({char_len, ch}, hit, hit))) {
       } else if (hit.is_match()) {
         if (OB_FAIL(ctx.add_token(ctx.fulltext(),
@@ -49,47 +50,58 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
                                   hit.end_pos_ - hit.start_pos_,
                                   hit.char_cnt_,
                                   ObIKTokenType::IK_CHINESE_TOKEN))) {
-        } else if (hit.is_prefix()) {
-          // match will record the start_cursor
+        } else if (kept != i) {
+          hits_[kept] = hit;
         }
+        ++kept;
       } else if (hit.is_prefix()) {
-        // nothing
+        if (kept != i) {
+          hits_[kept] = hit;
+        }
+        ++kept;
       } else if (hit.is_unmatch()) {
-        hits_.erase(hit);
+        // drop this prefix
       } else {
         ret = OB_UNEXPECT_INTERNAL_ERROR;
       }
     }
+    hits_cnt_ = kept;
+
     if (OB_SUCC(ret)) {
       // Start from this char
       // find range of dict
       ObDATrieHit hit(&dict_main_, ctx.get_cursor());
       if (OB_FAIL(dict_main_.match({char_len, ch}, hit))) {
-      } else if (hit.is_match()) {
-        // output token
-        hits_.push_back(hit);
-        ctx.add_token(ctx.fulltext(),
-                      ctx.get_cursor(),
-                      char_len,
-                      1,
-                      ObIKTokenType::IK_CHINESE_TOKEN);
-      } else if (hit.is_prefix()) {
-        hits_.push_back(hit);
-      } else {
+      } else if (!hit.is_match() && !hit.is_prefix()) {
         // ignore mismatch
+      } else if (OB_UNLIKELY(hits_cnt_ >= MAX_PENDING_HITS)) {
+        // Unreachable while the dictionary words are shorter than MAX_PENDING_HITS.
+        if (hit.is_match()) {
+          ctx.add_token(ctx.fulltext(),
+                        ctx.get_cursor(),
+                        char_len,
+                        1,
+                        ObIKTokenType::IK_CHINESE_TOKEN);
+        }
+      } else {
+        hits_[hits_cnt_++] = hit;
+        if (hit.is_match()) {
+          // output token
+          ctx.add_token(ctx.fulltext(),
+                        ctx.get_cursor(),
+                        char_len,
+                        1,
+                        ObIKTokenType::IK_CHINESE_TOKEN);
+        }
       }
     }
   } else {
     // stop previous match
-    hits_.clear();
+    hits_cnt_ = 0;
   }
 
-  if (OB_SUCC(ret)) {
-    if (ctx.is_last()) {
-      hits_.clear();
-    }
-  } else {
-    hits_.clear();
+  if (OB_FAIL(ret) || ctx.is_last()) {
+    hits_cnt_ = 0;
   }
 
   return ret;

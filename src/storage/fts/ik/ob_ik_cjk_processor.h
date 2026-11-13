@@ -29,11 +29,18 @@ class ObFTDictHub;
 class ObIKCJKProcessor : public ObIIKProcessor
 {
 public:
+  // The hit list only ever holds the prefixes that are still alive, which is
+  // bounded by the length of the longest word of the dictionary.  Keeping it in
+  // a fixed array avoids one allocator round trip per character for the append
+  // and another one for the removal of the dead prefixes.
+  static const int64_t MAX_PENDING_HITS = 64;
+
   ObIKCJKProcessor(const ObIFTDict &dict_main, ObIAllocator &alloc)
-      : hits_(alloc), dict_main_(dict_main), cjk_start_(-1), cjk_end_(-1)
+      : hits_cnt_(0), dict_main_(dict_main), cjk_start_(-1), cjk_end_(-1)
   {
+    (void)alloc;
   }
-  ~ObIKCJKProcessor() override { hits_.reset(); }
+  ~ObIKCJKProcessor() override {}
 
 public:
   int do_process(TokenizeContext &ctx,
@@ -42,7 +49,8 @@ public:
                  const ObFTCharUtil::CharType type) override;
 
 private:
-  ObList<ObDATrieHit, ObIAllocator> hits_;
+  ObDATrieHit hits_[MAX_PENDING_HITS];
+  int64_t hits_cnt_;
   const ObIFTDict &dict_main_;
   int64_t cjk_start_;
   int64_t cjk_end_;
