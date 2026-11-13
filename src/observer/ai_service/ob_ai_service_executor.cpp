@@ -181,7 +181,7 @@ int ObAiServiceExecutor::construct_new_endpoint(common::ObArenaAllocator &alloca
 {
   int ret = OB_SUCCESS;
   new_endpoint = old_endpoint;
-  if (OB_FAIL(new_endpoint.merge_delta_endpoint(allocator, alter_jbase))) {
+  if (OB_FAIL(new_endpoint.merge_delta_endpoint(allocator, alter_jbase, true /*is_alter*/))) {
   } 
   return ret;
 }

@@ -35,6 +35,46 @@ using namespace common;
 using namespace obcall;
 namespace sql
 {
+static const char *const AI_STATE_COLUMN_PREFIX = "__ai_state_";
+
+// An AI column is recognized by the hidden __ai_state_<column> column that is
+// created together with it.  The is_ai_column() flag is only reliable in the
+// schema that is built by the DDL resolver, the persisted schema does not
+// always keep it.
+static bool ai_is_ai_column(const ObTableSchema *table_schema, const ObString &column_name)
+{
+  bool bret = false;
+  if (OB_ISNULL(table_schema) || column_name.empty()) {
+  } else {
+    const ObColumnSchemaV2 *column = table_schema->get_column_schema(column_name);
+    if (OB_NOT_NULL(column) && column->is_ai_column()) {
+      bret = true;
+    } else {
+      const int64_t prefix_len = static_cast<int64_t>(strlen(AI_STATE_COLUMN_PREFIX));
+      char hidden_name[256];
+      const int64_t name_len = column_name.length();
+      if (name_len + prefix_len < static_cast<int64_t>(sizeof(hidden_name))) {
+        memcpy(hidden_name, AI_STATE_COLUMN_PREFIX, prefix_len);
+        memcpy(hidden_name + prefix_len, column_name.ptr(), name_len);
+        const int64_t hidden_len = name_len + prefix_len;
+        for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+             iter != table_schema->column_end(); ++iter) {
+          const ObColumnSchemaV2 *hidden_column = *iter;
+          if (OB_NOT_NULL(hidden_column) && hidden_column->is_hidden()) {
+            const ObString hidden_column_name = hidden_column->get_column_name_str();
+            if (hidden_column_name.length() == hidden_len
+                && 0 == strncasecmp(hidden_column_name.ptr(), hidden_name, hidden_len)) {
+              bret = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  return bret;
+}
+
 ObAlterTableResolver::ObAlterTableResolver(ObResolverParams &params)
     : ObDDLResolver(params),
       table_schema_(NULL),
@@ -585,6 +625,45 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
         case T_MODIFY_ALL_TRIGGERS: {
             alter_table_stmt->set_is_alter_triggers(true);
             if (OB_FAIL(resolve_modify_all_trigger(*action_node))) {
+            }
+            break;
+        }
+        case T_ALTER_TABLE_RETRY_AI_COLUMN: {
+            // ALTER TABLE ... RETRY AI COLUMN invalidates the result of one AI
+            // column, it is not a schema change and it cannot be combined with
+            // another alter action.
+            if (1 != node.num_child_) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                             "combining AI COLUMN RETRY with another ALTER action");
+              SQL_RESV_LOG(WARN, "ai column retry cannot be combined with another alter action", K(ret));
+            } else if (OB_ISNULL(action_node->children_) || action_node->num_child_ <= 0
+                       || OB_ISNULL(action_node->children_[0])
+                       || OB_ISNULL(action_node->children_[0]->str_value_)
+                       || action_node->children_[0]->str_len_ <= 0) {
+              ret = OB_ERR_UNEXPECTED;
+              SQL_RESV_LOG(WARN, "invalid parse tree of ai column retry", K(ret));
+            } else {
+              ObString column_name;
+              column_name.assign_ptr(action_node->children_[0]->str_value_,
+                                     action_node->children_[0]->str_len_);
+              const ObColumnSchemaV2 *column_schema = NULL;
+              if (OB_ISNULL(column_schema = table_schema_->get_column_schema(column_name))) {
+                ret = OB_NOT_SUPPORTED;
+                LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                               "retrying a column that is not an AI column");
+                SQL_RESV_LOG(WARN, "ai column retry of an unknown column", K(ret),
+                             K(column_name));
+              } else if (!ai_is_ai_column(table_schema_, column_name)) {
+                ret = OB_NOT_SUPPORTED;
+                LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                               "retrying a column that is not an AI column");
+                SQL_RESV_LOG(WARN, "ai column retry of a plain column", K(ret),
+                             K(column_name));
+              } else {
+                alter_table_stmt->set_is_ai_column_retry(true);
+                alter_table_stmt->set_ai_retry_column_name(column_schema->get_column_name_str());
+              }
             }
             break;
         }
@@ -3457,6 +3536,10 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          } else if (alter_column_schema.is_ai_column()
+                     && OB_FAIL(add_ai_hidden_columns_for_alter(*table_schema_,
+                                                                alter_column_schema,
+                                                                *alter_table_stmt))) {
           }
         }
       }

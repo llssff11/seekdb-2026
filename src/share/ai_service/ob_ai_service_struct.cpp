@@ -44,6 +44,10 @@ const char *VALID_PROVIDERS[] = {
 // the ollama model service does not need the access key
 static const char *OLLAMA_PROVIDER = "OLLAMA";
 
+// the valid range of the max concurrency of one ai model endpoint is [1, 1024]
+static const int64_t MIN_AI_ENDPOINT_MAX_CONCURRENCY = 1;
+static const int64_t MAX_AI_ENDPOINT_MAX_CONCURRENCY = 1024;
+
 static bool is_ollama_provider(const ObString &provider)
 {
   return !provider.empty() && provider.case_compare(OLLAMA_PROVIDER) == 0;
@@ -89,6 +93,7 @@ int ObAiModelEndpointInfo::deep_copy(
   int ret = OB_SUCCESS;
   reset();
   endpoint_id_ = other.endpoint_id_;
+  max_concurrency_ = other.max_concurrency_;
   if (OB_FAIL(ob_write_string(allocator, other.name_, name_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.scope_, scope_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.ai_model_name_, ai_model_name_))) {
@@ -156,7 +161,7 @@ bool ObAiModelEndpointInfo::is_valid_provider(const ObString &provider)
   return is_valid;
 }
 
-int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &allocator, const ObIJsonBase &delta_jbase)
+int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &allocator, const ObIJsonBase &delta_jbase, const bool is_alter)
 {
   int ret = OB_SUCCESS;
   JsonObjectIterator iter = delta_jbase.object_iterator();
@@ -165,8 +170,31 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
     ObJsonObjPair elem;
     if (OB_FAIL(iter.get_elem(elem))) {
     } else {
-      EXTRACT_JSON_ELEM_STR("scope", scope_)
-      EXTRACT_JSON_ELEM_STR("ai_model_name", ai_model_name_)
+      if (elem.first.case_compare("scope") == 0) {
+        if (is_alter) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("the scope of the ai model endpoint can not be altered", K(ret), K(elem.first));
+        } else if (elem.second->json_type() != ObJsonNodeType::J_STRING) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("invalid json type", K(ret), K(elem.first), K(elem.second->json_type()));
+        } else {
+          scope_ = ObString(elem.second->get_data_length(), elem.second->get_data());
+        }
+      } else if (elem.first.case_compare("ai_model_name") == 0) {
+        if (is_alter) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("the ai model name of the ai model endpoint can not be altered", K(ret), K(elem.first));
+        } else if (elem.second->json_type() != ObJsonNodeType::J_STRING) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("invalid json type", K(ret), K(elem.first), K(elem.second->json_type()));
+        } else {
+          ai_model_name_ = ObString(elem.second->get_data_length(), elem.second->get_data());
+        }
+      } else
       EXTRACT_JSON_ELEM_STR("url", url_)
       EXTRACT_JSON_ELEM_STR_WITH_PROCESS("access_key", access_key_, has_api_key = true)
       EXTRACT_JSON_ELEM_STR("provider", provider_)
@@ -174,6 +202,24 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
       EXTRACT_JSON_ELEM_STR("parameters", parameters_)
       EXTRACT_JSON_ELEM_STR("request_transform_fn", request_transform_fn_)
       EXTRACT_JSON_ELEM_STR("response_transform_fn", response_transform_fn_)
+      if (elem.first.case_compare("max_concurrency") == 0) {
+        const ObJsonNodeType json_type = elem.second->json_type();
+        if (json_type != ObJsonNodeType::J_INT && json_type != ObJsonNodeType::J_UINT) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("invalid json type", K(ret), K(elem.first), K(json_type));
+        } else {
+          const int64_t max_concurrency = elem.second->get_int();
+          if (max_concurrency < MIN_AI_ENDPOINT_MAX_CONCURRENCY
+              || max_concurrency > MAX_AI_ENDPOINT_MAX_CONCURRENCY) {
+            ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+            LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+            LOG_WARN("invalid max concurrency value", K(ret), K(max_concurrency));
+          } else {
+            max_concurrency_ = static_cast<int32_t>(max_concurrency);
+          }
+        }
+      } else
       EXTRACT_JSON_ELEM_END()
     }
     iter.next();

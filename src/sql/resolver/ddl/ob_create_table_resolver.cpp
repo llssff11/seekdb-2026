@@ -896,6 +896,15 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       }
     }
 
+    // AI column support: an ai column can not depend on another ai column, and every
+    // ai column gets three hidden columns (state / request / result spec) that are
+    // persisted in __all_column like any other hidden column.
+    if (OB_SUCC(ret) && RESOLVE_NON_COL != resolve_rule) {
+      if (OB_FAIL(check_ai_column_dependency(table_schema, *node))) {
+      } else if (OB_FAIL(add_ai_hidden_columns(table_schema))) {
+      }
+    }
+
     // A table must have at least one column as a visible column
     if (OB_SUCC(ret)) {
       // RESOLVE_NON_COL == resolve_rule when, only parse non-column definitions
@@ -2339,6 +2348,51 @@ int ObCreateTableResolver::uk_or_heap_table_pk_add_to_index_list(ObArray<int> &i
     LOG_USER_ERROR(OB_ERR_TOO_MANY_KEYS, OB_MAX_INDEX_PER_TABLE);
   } else if (OB_FAIL(index_node_position_list.push_back(node_index))){
   } else {
+  }
+  return ret;
+}
+
+int ObCreateTableResolver::add_ai_hidden_columns(share::schema::ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObString, 4> ai_column_names;
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_schema.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "column schema is null", K(ret));
+    } else if (column->is_ai_column()) {
+      if (OB_FAIL(ai_column_names.push_back(column->get_column_name_str()))) {
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_names.count(); ++i) {
+    for (int64_t kind = 0; OB_SUCC(ret) && kind < 3; ++kind) {
+      ObColumnSchemaV2 hidden_column;
+      if (OB_FAIL(build_ai_hidden_column(ai_column_names.at(i), kind, hidden_column))) {
+      } else {
+        hidden_column.set_column_id(gen_column_id());
+        if (0 == kind) {
+          // Persist the dependency list of the AI column in the comment of the
+          // hidden state column, so that a DML statement can find out whether an
+          // update invalidates the AI column without reading the metadata table.
+          const ObColumnSchemaV2 *ai_column = table_schema.get_column_schema(ai_column_names.at(i));
+          ObSqlString dep_ids;
+          if (OB_ISNULL(ai_column)) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_RESV_LOG(WARN, "the ai column schema is null", K(ret));
+          } else if (OB_FAIL(build_ai_dep_ids(table_schema,
+                                             ai_column->get_ai_dep_column_ids(),
+                                             dep_ids))) {
+            SQL_RESV_LOG(WARN, "failed to build the ai dependency ids", K(ret));
+          } else if (OB_FAIL(build_ai_dep_comment(dep_ids.string(), hidden_column))) {
+            SQL_RESV_LOG(WARN, "failed to build the ai dependency comment", K(ret));
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(table_schema.add_column(hidden_column))) {
+        }
+      }
+    }
   }
   return ret;
 }

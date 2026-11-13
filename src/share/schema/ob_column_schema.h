@@ -194,6 +194,41 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline bool is_zero_fill() const { return is_zero_fill_; }
   inline bool is_autoincrement() const { return is_autoincrement_; }
   inline bool is_hidden() const { return is_hidden_; }
+  // ----- AI column definition (persisted in __all_ai_column) -----
+  inline bool is_ai_column() const { return is_ai_column_; }
+  inline void set_is_ai_column(const bool is_ai_column) { is_ai_column_ = is_ai_column; }
+  inline int64_t get_ai_func_type() const { return ai_func_type_; }
+  inline void set_ai_func_type(const int64_t func_type) { ai_func_type_ = func_type; }
+  inline int64_t get_ai_result_type() const { return ai_result_type_; }
+  inline void set_ai_result_type(const int64_t result_type) { ai_result_type_ = result_type; }
+  inline int64_t get_ai_max_retries() const { return ai_max_retries_; }
+  inline void set_ai_max_retries(const int64_t max_retries) { ai_max_retries_ = max_retries; }
+  inline int64_t get_ai_vector_dim() const { return ai_vector_dim_; }
+  inline void set_ai_vector_dim(const int64_t vector_dim) { ai_vector_dim_ = vector_dim; }
+  inline const common::ObString &get_ai_model_name() const { return ai_model_name_; }
+  inline int set_ai_model_name(const common::ObString &model_name) { return deep_copy_str(model_name, ai_model_name_); }
+  inline const common::ObString &get_ai_prompt_expr() const { return ai_prompt_expr_; }
+  inline int set_ai_prompt_expr(const common::ObString &prompt_expr) { return deep_copy_str(prompt_expr, ai_prompt_expr_); }
+  inline const common::ObString &get_ai_normalized_expr() const { return ai_normalized_expr_; }
+  inline int set_ai_normalized_expr(const common::ObString &normalized_expr) { return deep_copy_str(normalized_expr, ai_normalized_expr_); }
+  inline const common::ObString &get_ai_system_hint() const { return ai_system_hint_; }
+  inline int set_ai_system_hint(const common::ObString &system_hint) { return deep_copy_str(system_hint, ai_system_hint_); }
+  inline const common::ObString &get_ai_sync_mode() const { return ai_sync_mode_; }
+  inline int set_ai_sync_mode(const common::ObString &sync_mode) { return deep_copy_str(sync_mode, ai_sync_mode_); }
+  inline const common::ObString &get_ai_dep_column_ids() const { return ai_dep_column_ids_; }
+  // The dependency column ids of an AI column are persisted in the comment of the
+  // hidden state column that backs it (e.g. "ai_deps:17,18").  The DML resolver
+  // reads them from the table schema, the AI metadata table is a system table and
+  // is not part of the schema that a DML statement resolves against.
+#define AI_COLUMN_DEP_COMMENT_PREFIX "ai_deps:"
+
+  inline int set_ai_dep_column_ids(const common::ObString &dep_column_ids) { return deep_copy_str(dep_column_ids, ai_dep_column_ids_); }
+  // Build the name of one of the three hidden columns that back an AI column.
+  // kind: 0 -> state, 1 -> request, 2 -> result spec.
+  static int build_ai_hidden_column_name(const common::ObString &ai_column_name,
+                                         const int64_t kind,
+                                         common::ObIAllocator &alloc,
+                                         common::ObString &name);
   inline bool is_string_type() const { return meta_type_.is_string_type(); }
   inline bool is_json() const { return meta_type_.is_json(); }
   inline bool is_geometry() const { return meta_type_.is_geometry(); }
@@ -398,6 +433,18 @@ private:
   ObSkipIndexColumnAttr skip_index_attr_;
   int64_t lob_chunk_size_;
   share::ObLocalSessionVar local_session_vars_;
+  // AI column definition, serialized after the fields above to keep compatibility.
+  bool is_ai_column_;
+  int64_t ai_func_type_;
+  int64_t ai_result_type_;
+  int64_t ai_max_retries_;
+  int64_t ai_vector_dim_;
+  common::ObString ai_model_name_;
+  common::ObString ai_prompt_expr_;
+  common::ObString ai_normalized_expr_;
+  common::ObString ai_system_hint_;
+  common::ObString ai_sync_mode_;
+  common::ObString ai_dep_column_ids_;
 };
 
 inline int32_t ObColumnSchemaV2::get_data_length() const

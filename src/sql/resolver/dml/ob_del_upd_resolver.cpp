@@ -432,6 +432,135 @@ int ObDelUpdResolver::generate_wrapper_expr_for_assignemnts(ObIArray<ObAssignmen
   return ret;
 }
 
+namespace
+{
+// An AI column always comes with a hidden state column named __ai_state_<column
+// name>.  Its comment carries the ids of the columns the AI column depends on,
+// e.g. "ai_deps:17,18".  The dependency list is part of the table schema, so a
+// DML statement can find out whether an update invalidates an AI column without
+// touching the AI metadata table.
+struct AiColumnResetInfo
+{
+  ObString column_name_;
+  ObString dep_ids_;
+  AiColumnResetInfo() : column_name_(), dep_ids_() {}
+  TO_STRING_KV(K_(column_name), K_(dep_ids));
+};
+
+int collect_ai_column_reset_info(const ObTableSchema &table_schema,
+                                 common::ObIArray<AiColumnResetInfo> &infos)
+{
+  int ret = OB_SUCCESS;
+  static const char AI_STATE_COLUMN_PREFIX[] = "__ai_state_";
+  const int64_t state_prefix_len = static_cast<int64_t>(sizeof(AI_STATE_COLUMN_PREFIX) - 1);
+  const int64_t dep_prefix_len = static_cast<int64_t>(sizeof(AI_COLUMN_DEP_COMMENT_PREFIX) - 1);
+  for (ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+       OB_SUCC(ret) && iter != table_schema.column_end(); ++iter) {
+    const ObColumnSchemaV2 *hidden_column = *iter;
+    if (OB_ISNULL(hidden_column) || !hidden_column->is_hidden()) {
+      continue;
+    }
+    const ObString hidden_name = hidden_column->get_column_name_str();
+    if (hidden_name.length() <= state_prefix_len
+        || !hidden_name.prefix_match_ci(AI_STATE_COLUMN_PREFIX)) {
+      continue;
+    }
+    AiColumnResetInfo info;
+    info.column_name_.assign_ptr(hidden_name.ptr() + state_prefix_len,
+                                 hidden_name.length() - state_prefix_len);
+    const ObString &comment = hidden_column->get_comment_str();
+    if (comment.length() >= dep_prefix_len) {
+      bool prefix_match = true;
+      for (int64_t k = 0; prefix_match && k < dep_prefix_len; ++k) {
+        prefix_match = (comment.ptr()[k] == AI_COLUMN_DEP_COMMENT_PREFIX[k]);
+      }
+      if (prefix_match) {
+        info.dep_ids_.assign_ptr(comment.ptr() + dep_prefix_len,
+                                 comment.length() - dep_prefix_len);
+      }
+    }
+    if (OB_FAIL(infos.push_back(info))) {
+      LOG_WARN("ai column dml, collect the reset info failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+// The statement assigns the AI column itself: the value that the statement
+// writes is kept, the AI column must not be reset again.
+bool ai_column_is_assigned(const ObColumnSchemaV2 &ai_column,
+                           const common::ObIArray<ObAssignment> &assignments)
+{
+  bool assigned = false;
+  for (int64_t i = 0; !assigned && i < assignments.count(); ++i) {
+    const ObColumnRefRawExpr *column_expr = assignments.at(i).column_expr_;
+    if (OB_NOT_NULL(column_expr)
+        && column_expr->get_column_id() == ai_column.get_column_id()) {
+      assigned = true;
+    }
+  }
+  return assigned;
+}
+
+// An AI column has to be reset to null when one of the columns it depends on is
+// updated by the statement.
+bool ai_column_must_be_reset(const ObColumnSchemaV2 &ai_column,
+                             const common::ObIArray<AiColumnResetInfo> &infos,
+                             const common::ObIArray<ObAssignment> &assignments)
+{
+  const ObString ai_column_name = ai_column.get_column_name_str();
+  const AiColumnResetInfo *info = NULL;
+  for (int64_t i = 0; NULL == info && i < infos.count(); ++i) {
+    const ObString &name = infos.at(i).column_name_;
+    if (name.length() != ai_column_name.length()) {
+      continue;
+    }
+    bool same_name = true;
+    for (int64_t k = 0; same_name && k < name.length(); ++k) {
+      char l = name.ptr()[k];
+      char r = ai_column_name.ptr()[k];
+      if (l >= 'A' && l <= 'Z') { l = static_cast<char>(l - 'A' + 'a'); }
+      if (r >= 'A' && r <= 'Z') { r = static_cast<char>(r - 'A' + 'a'); }
+      same_name = (l == r);
+    }
+    if (same_name) {
+      info = &infos.at(i);
+    }
+  }
+  if (NULL == info) {
+    // not an AI column
+  } else if (ai_column_is_assigned(ai_column, assignments)) {
+    // the result of the AI column is written by the statement, nothing to reset
+  } else {
+    const ObString &dep_ids = info->dep_ids_;
+    for (int64_t pos = 0; pos < dep_ids.length(); ) {
+      int64_t end = pos;
+      uint64_t dep_id = 0;
+      bool valid = true;
+      while (end < dep_ids.length() && ',' != dep_ids.ptr()[end]) {
+        const char c = dep_ids.ptr()[end];
+        if (c < '0' || c > '9') {
+          valid = false;
+        } else if (valid) {
+          dep_id = dep_id * 10 + static_cast<uint64_t>(c - '0');
+        }
+        ++end;
+      }
+      if (valid) {
+        for (int64_t i = 0; i < assignments.count(); ++i) {
+          const ObColumnRefRawExpr *column_expr = assignments.at(i).column_expr_;
+          if (OB_NOT_NULL(column_expr) && column_expr->get_column_id() == dep_id) {
+            return true;
+          }
+        }
+      }
+      pos = end + 1;
+    }
+  }
+  return false;
+}
+} // namespace
+
 int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSchema *table_schema,
                                                                 ObSchemaGetterGuard *schema_guard,
                                                                 const common::ObIArray<ObAssignment> &assigns,
@@ -478,6 +607,47 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
       }
     }
   }
+  // An AI column may be invalidated implicitly when one of the columns it depends on
+  // is updated.  When such an AI column is covered by a vector index, the index has to
+  // be maintained as well, otherwise the stale vector stays in the index.  AI columns
+  // are recognized by the hidden __ai_state_<column> column created together with them.
+  if (OB_SUCC(ret) && !update_with_vector_index) {
+    const char *const AI_STATE_COLUMN_PREFIX = "__ai_state_";
+    const int64_t ai_state_prefix_len = static_cast<int64_t>(strlen(AI_STATE_COLUMN_PREFIX));
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *hidden_column = *iter;
+      if (OB_ISNULL(hidden_column) || !hidden_column->is_hidden()) {
+        continue;
+      }
+      const ObString hidden_column_name = hidden_column->get_column_name_str();
+      if (hidden_column_name.length() <= ai_state_prefix_len
+          || !hidden_column_name.prefix_match_ci(AI_STATE_COLUMN_PREFIX)) {
+        continue;
+      }
+      const ObString ai_column_name(static_cast<int64_t>(hidden_column_name.length() - ai_state_prefix_len),
+                                    hidden_column_name.ptr() + ai_state_prefix_len);
+      const ObColumnSchemaV2 *ai_column = table_schema->get_column_schema(ai_column_name);
+      if (OB_ISNULL(ai_column)) {
+        continue;
+      }
+      bool ai_column_has_vector_index = false;
+      ObIndexType ai_index_type = INDEX_TYPE_MAX;
+      if (OB_FAIL(ObVectorIndexUtil::check_column_has_vector_index(*table_schema,
+                                                                    *schema_guard,
+                                                                    ai_column->get_column_id(),
+                                                                    ai_column_has_vector_index,
+                                                                    ai_index_type))) {
+        ret = OB_FAIL(ret) ? ret : OB_ERR_UNEXPECTED;
+        LOG_WARN("fail to check the vector index of the ai column", K(ai_column_name));
+      } else {
+        if (ai_column_has_vector_index) {
+          update_with_vector_index = true;
+          break;
+        }
+      }
+    }
+  }
   return ret;
 }
 
@@ -518,12 +688,27 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                                  assigns.at(i).assignments_,
                                                                  update_with_vector_index))) {
     } else {
+      // An AI column is invalidated implicitly when one of the columns it depends on is
+      // updated.  Reset the AI column to null in the statement itself, so that the storage
+      // layer and the vector index built on the AI column are maintained as well.
+      ObSEArray<AiColumnResetInfo, 4> ai_reset_infos;
+      if (T_UPDATE_SCOPE == scope) {
+        if (OB_FAIL(collect_ai_column_reset_info(*table_schema, ai_reset_infos))) {
+          ret = OB_FAIL(ret) ? ret : OB_ERR_UNEXPECTED;
+        }
+      }
       for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
           (OB_SUCCESS == ret && iter != table_schema->column_end()); ++iter) {
         ColumnItem *col_item = NULL;
         ObColumnSchemaV2 *column_schema = *iter;
         bool need_assigned = false;
+        bool ai_column_need_reset = false;
         uint64_t column_id = OB_INVALID_ID;
+        if (OB_SUCC(ret) && !OB_ISNULL(column_schema)) {
+          ai_column_need_reset = ai_column_must_be_reset(*column_schema,
+                                                          ai_reset_infos,
+                                                          assigns.at(i).assignments_);
+        }
         if (NULL == column_schema) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get column schema fail", K(column_schema));
@@ -537,7 +722,8 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
         } else if (FALSE_IT(need_assigned = need_assigned || 
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
-                                             (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
+                                             (update_with_vector_index || T_INSERT_SCOPE == scope))
+                                          || ai_column_need_reset)) {
         } else if (need_assigned) {
           // for insert scope, on duplicate key update column list already
           // exists in insert list, therefore, only need to add assignment.
@@ -553,7 +739,12 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
           } else {
             assignment.column_expr_ = col_item->expr_;
             assignment.is_implicit_ = true;
-            if (column_schema->is_on_update_current_timestamp()) {
+            if (ai_column_need_reset) {
+              // the AI column is invalidated by the update, reset it to null
+              if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_, assignment.expr_))) {
+                ret = OB_FAIL(ret) ? ret : OB_ERR_UNEXPECTED;
+              }
+            } else if (column_schema->is_on_update_current_timestamp()) {
               assignment.column_expr_->set_result_flag(ON_UPDATE_NOW_FLAG);
               ObDefaultValueUtils utils(stmt, &params_, this);
               if (OB_FAIL(utils.build_now_expr(col_item, assignment.expr_))) {

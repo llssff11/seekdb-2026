@@ -40,6 +40,19 @@ private:
   common::ObArenaAllocator allocator_;
 };
 
+// Polls the ai column task table and publishes the model results of the
+// asynchronous ai columns.
+class ObAIColumnTaskWorker : private common::ObTimerTask
+{
+public:
+  ObAIColumnTaskWorker();
+  virtual ~ObAIColumnTaskWorker() {}
+  int schedule(common::ObTimer &timer);
+private:
+  void runTimerTask() override;
+  static constexpr int64_t SCHEDULE_PERIOD = 100 * 1000L;
+};
+
 class ObSqlMemoryTimerTask : private common::ObTimerTask
 {
 public:

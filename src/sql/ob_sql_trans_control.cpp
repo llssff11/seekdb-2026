@@ -26,6 +26,7 @@
 #include "common/storage/ob_sequence.h"
 #include "share/ob_server_struct.h"
 #include "sql/monitor/show_trace/ob_show_trace.h"
+#include "sql/engine/dml/ob_ai_column_task.h"
 
 #ifdef CHECK_SESSION
 #error "redefine macro CHECK_SESSION"
@@ -273,6 +274,22 @@ int ObSqlTransControl::end_trans(ObSQLSessionInfo *session,
         || OB_TRANS_ROLLBACKED == ret
         || rollback_tx_ended;
       reset_session_tx_state(session, reuse_tx, reset_trans_variable);
+    }
+    // The rows of the AI column task table are written by an autonomous
+    // transaction, they are not covered by the rollback of the transaction of
+    // the user statement.  A rollback therefore has to remove the task rows
+    // of the rolled back transaction again.
+    if (is_rollback) {
+      // The transaction id has to be the one of the transaction that is
+      // rolled back.  It is read before the session state is reset because
+      // the reset releases the transaction descriptor of the session.
+      int ai_ret = ai_column_task_on_end_trans(session->get_server_sid(),
+                                                tx_id,
+                                                true);
+      if (OB_FAIL(ai_ret)) {
+        LOG_WARN("ai column task, clean up the task rows of the transaction failed",
+                 K(ai_ret), K(tx_id));
+      }
     }
   }
   if (callback && !is_rollback) {

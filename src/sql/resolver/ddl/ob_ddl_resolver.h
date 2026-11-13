@@ -557,6 +557,29 @@ protected:
   int resolve_lob_storage_parameter(share::schema::ObColumnSchemaV2 &column, const ParseNode &param_node);
   int resolve_lob_chunk_size(const ParseNode &size_node, int64_t &lob_chunk_size);
   int resolve_lob_chunk_size(share::schema::ObColumnSchemaV2 &column, const ParseNode &lob_chunk_size_node);
+
+  // ----- AI column (CREATE TABLE / ALTER TABLE ... AI COLUMN) -----
+  int resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &column,
+                                  const ParseNode &ai_column_node);
+  int resolve_ai_column_options(share::schema::ObColumnSchemaV2 &column,
+                                const ParseNode *options_node);
+  int resolve_ai_expr_to_text(const ParseNode *node, common::ObSqlString &text);
+  int build_ai_hidden_column(const common::ObString &ai_column_name,
+                             const int64_t kind,
+                             share::schema::ObColumnSchemaV2 &hidden_column);
+  int add_ai_hidden_columns_for_alter(const share::schema::ObTableSchema &table_schema,
+                                      const share::schema::AlterColumnSchema &ai_column,
+                                      ObAlterTableStmt &alter_table_stmt);
+  // Resolve the dependency names of an AI column against the table schema and
+  // build the comma separated column id list that is stored in the comment of
+  // the hidden state column.
+  int build_ai_dep_ids(const share::schema::ObTableSchema &table_schema,
+                       const common::ObString &dep_names,
+                       common::ObSqlString &dep_ids);
+  int build_ai_dep_comment(const common::ObString &dep_ids,
+                           share::schema::ObColumnSchemaV2 &column);
+  int check_ai_column_dependency(share::schema::ObTableSchema &table_schema,
+                                 const ParseNode &table_elements);
   int resolve_semistruct_encoding_type(const ParseNode *option_node, const bool is_index_option);
   /*
   int resolve_generated_column_definition(

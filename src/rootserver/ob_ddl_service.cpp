@@ -8588,6 +8588,29 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
       }
     }
 
+    // Persist the metadata of the ai columns added by this alter table statement.
+    if (OB_SUCC(ret)) {
+      ObSchemaService *schema_service = schema_service_->get_schema_service();
+      if (OB_ISNULL(schema_service)) {
+        ret = OB_ERR_UNEXPECTED;
+        RS_LOG(WARN, "schema service is null", K(ret));
+      } else {
+        const int64_t origin_max_column_id = origin_table_schema.get_max_used_column_id();
+        for (int64_t i = 0; OB_SUCC(ret) && i < new_table_schema.get_column_count(); ++i) {
+          const ObColumnSchemaV2 *column = new_table_schema.get_column_schema_by_idx(i);
+          if (OB_ISNULL(column)) {
+            ret = OB_ERR_UNEXPECTED;
+            RS_LOG(WARN, "column schema is null", K(ret));
+          } else if (column->is_ai_column() && column->get_column_id() > origin_max_column_id) {
+            if (OB_FAIL(schema_service->get_table_sql_service().insert_ai_column_meta(
+                        trans, new_table_schema, *column))) {
+              RS_LOG(WARN, "failed to insert ai column metadata", K(ret), K(*column));
+            }
+          }
+        }
+      }
+    }
+
     bool is_add_lob = false;
     if(OB_FAIL(ret)) {
     } else if (OB_FAIL(blocksstable::check_skip_index_valid(new_table_schema))) {

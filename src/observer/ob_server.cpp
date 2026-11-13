@@ -628,6 +628,8 @@ ObServer::ObServer()
     ctas_clean_up_timer_(),
     duty_task_(),
     sql_mem_task_(),
+    ai_column_task_timer_(),
+    ai_column_task_worker_(),
     ctas_clean_up_task_(),
     refresh_cpu_frequency_task_(),
     schema_status_proxy_(sql_proxy_),
@@ -983,6 +985,10 @@ void ObServer::destroy()
     FLOG_INFO("begin to destroy ctas clean up timer");
     ctas_clean_up_timer_.destroy();
     FLOG_INFO("ctas clean up timer destroyed");
+
+    FLOG_INFO("begin to destroy ai column task timer");
+    ai_column_task_timer_.destroy();
+    FLOG_INFO("ai column task timer destroyed");
 
     FLOG_INFO("begin to destroy local management service");
     local_management_service_.destroy();
@@ -1613,6 +1619,10 @@ int ObServer::stop()
     ctas_clean_up_timer_.stop();
     FLOG_INFO("ctas clean up timer stopped");
 
+    FLOG_INFO("begin to stop ai column task timer");
+    ai_column_task_timer_.stop();
+    FLOG_INFO("ai column task timer stopped");
+
     FLOG_INFO("begin to stop inner sql proxy");
     sql_proxy_.stop();
     ddl_sql_proxy_.stop();
@@ -1942,6 +1952,8 @@ int ObServer::init_config_module()
   } else if (OB_FAIL(server_gtimer_.init("ServerGTimer", ObMemAttr("ServerGTimer")))) {
   } else if (OB_FAIL(sql_mem_timer_.init("SqlMemTimer", ObMemAttr("SqlMemTimer")))) {
   } else if (OB_FAIL(ctas_clean_up_timer_.init("CTASCleanUp", ObMemAttr("CTASCleanUp")))) {
+  } else if (OB_FAIL(ai_column_task_timer_.init("AIColumnTask",
+                                                ObMemAttr("AIColumnTask")))) {
   }
 
   return ret;
@@ -2191,6 +2203,7 @@ int ObServer::init_server_runtime()
   if (OB_SUCC(ret)) {
     if (OB_FAIL(duty_task_.schedule(server_gtimer_))) {
     } else if (OB_FAIL(sql_mem_task_.schedule(sql_mem_timer_))) {
+    } else if (OB_FAIL(ai_column_task_worker_.schedule(ai_column_task_timer_))) {
     }
   }
 

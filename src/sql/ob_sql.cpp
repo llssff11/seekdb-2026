@@ -26,6 +26,8 @@
 #include "sql/ob_sql_init.h"
 #include "sql/resolver/ob_resolver.h"
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
+#include "sql/resolver/ddl/ob_alter_table_stmt.h"
+#include "sql/engine/dml/ob_ai_column_task.h"
 #include "sql/resolver/cmd/ob_call_procedure_stmt.h"
 #include "sql/resolver/cmd/ob_anonymous_block_stmt.h"
 #include "sql/privilege_check/ob_privilege_check.h"
@@ -50,6 +52,18 @@ using namespace pl;
 
 namespace sql
 {
+// implemented in sql/engine/dml/ob_dml_service.cpp
+class ObDMLStmt;
+class ObExecContext;
+int ai_column_check_strict_read(ObExecContext &exec_ctx,
+                                ObDMLStmt *stmt,
+                                const common::ObString &sql_text);
+int ai_build_ai_column_retry_sql(const common::ObString &db_name,
+                                 const common::ObString &table_name,
+                                 const common::ObString &column_name,
+                                 const common::ObString &sql_text,
+                                 common::ObIAllocator &allocator,
+                                 common::ObString &retry_sql);
 
 const int64_t ObSql::max_error_length = 80;
 const int64_t ObSql::SQL_MEM_SIZE_LIMIT = 1024 * 1024 * 64;
@@ -2213,6 +2227,18 @@ int ObSql::generate_stmt(ParseResult &parse_result,
             ObDMLStmt *dml_stmt = NULL;
             ObVariableSetStmt *variable_set_stmt = NULL;
             if ((dml_stmt = dynamic_cast<ObDMLStmt*>(stmt)) != NULL) {
+              // Strict read is a per-execution semantic, so it must not depend
+              // on a plan cache miss (generate_plan is skipped on a hit).
+              // The check must reject the statement, a client that asks for
+              // an unfinished AI result has to see the error.
+              if (OB_SUCC(ret)) {
+                ret = ai_column_check_strict_read(result.get_exec_context(),
+                                                  dml_stmt,
+                                                  resolver_ctx.query_ctx_->get_sql_stmt());
+                if (OB_FAIL(ret)) {
+                  LOG_WARN("ai column strict read check failed", K(ret));
+                }
+              }
               const ObGlobalHint &global_hint = resolver_ctx.query_ctx_->get_global_hint();
               result.set_is_calc_found_rows(dml_stmt->is_calc_found_rows());
               plan_ctx->set_is_affect_found_row(dml_stmt->is_affect_found_rows());
@@ -2225,6 +2251,25 @@ int ObSql::generate_stmt(ParseResult &parse_result,
               }
             } else if ((variable_set_stmt = dynamic_cast<ObVariableSetStmt*>(stmt)) != NULL) {
               result.set_has_global_variable(variable_set_stmt->has_global_variable());
+            }
+            ObAlterTableStmt *alter_table_stmt = dynamic_cast<ObAlterTableStmt*>(stmt);
+            if (OB_SUCC(ret) && OB_NOT_NULL(alter_table_stmt)
+                && alter_table_stmt->is_ai_column_retry()) {
+              // The retry statement is rewritten into an update of the AI
+              // column, the predicate is taken from the text of the statement.
+              const ObString &sql_text = resolver_ctx.query_ctx_->get_sql_stmt();
+              ObString retry_sql;
+              ret = ai_build_ai_column_retry_sql(alter_table_stmt->get_database_name(),
+                                                 alter_table_stmt->get_table_name(),
+                                                 alter_table_stmt->get_ai_retry_column_name(),
+                                                 sql_text,
+                                                 result.get_exec_context().get_allocator(),
+                                                 retry_sql);
+              if (OB_SUCC(ret)) {
+                alter_table_stmt->set_ai_retry_sql(retry_sql);
+              } else {
+                LOG_WARN("ai column retry, build the retry statement failed", K(ret));
+              }
             }
           }
           if (OB_SUCC(ret)) {

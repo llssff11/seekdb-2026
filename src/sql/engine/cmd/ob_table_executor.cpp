@@ -29,6 +29,7 @@
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
+#include "sql/engine/dml/ob_ai_column_task.h"
 #include "sql/resolver/ddl/ob_drop_table_stmt.h"
 #include "sql/resolver/ddl/ob_rename_table_stmt.h"
 #include "sql/resolver/ddl/ob_truncate_table_stmt.h"
@@ -754,6 +755,23 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  if (stmt.is_ai_column_retry()) {
+    // RETRY AI COLUMN does not change the schema, it invalidates the result
+    // of the AI column for the rows that match the predicate.
+    const ObString &retry_sql = stmt.get_ai_retry_sql();
+    int64_t affected_rows = 0;
+    if (retry_sql.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ai column retry, the retry statement is empty", K(ret));
+    } else if (OB_FAIL(ai_execute_inner_write_raw(retry_sql, affected_rows))) {
+      LOG_WARN("ai column retry, execute the retry statement failed", K(ret),
+               "sql", retry_sql);
+    } else {
+      LOG_INFO("ai column retry, the retry statement is done", K(affected_rows),
+               "sql", retry_sql);
+    }
+    return ret;
+  }
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();
   obcall::ObExchangePartitionArg &exchange_partition_arg = stmt.get_exchange_partition_arg();

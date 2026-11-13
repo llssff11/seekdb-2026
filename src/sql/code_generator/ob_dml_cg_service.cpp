@@ -209,6 +209,139 @@ int ObDmlCgService::generate_delete_ctdef(ObLogDelUpd &op,
   return ret;
 }
 
+// An AI column is invalidated (reset to NULL) by the DML layer when one of
+// its dependency columns is changed.  The storage layer only writes the
+// columns that are listed in the row projector, every other column keeps its
+// old value, so the AI column has to be added to the update write set
+// explicitly.  Otherwise the invalidation would be silently dropped and the
+// stale AI result would survive the update.
+static int collect_ai_column_ids(const ObTableSchema *table_schema,
+                                ObIArray<uint64_t> &ai_column_ids)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(table_schema)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid table schema", K(table_schema));
+  } else {
+    const ObString prefix = ObString::make_string("__ai_state_");
+    ObSEArray<ObString, 4> ai_names;
+    // 1. collect the result column names from the persisted hidden columns
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_hidden()) {
+        const ObString name = column->get_column_name_str();
+        if (name.length() > prefix.length()
+            && 0 == strncasecmp(name.ptr(), prefix.ptr(), prefix.length())
+            && OB_FAIL(ai_names.push_back(
+                    ObString(name.length() - prefix.length(),
+                             name.ptr() + prefix.length())))) {
+          LOG_WARN("append ai column name failed", K(ret));
+        }
+      }
+    }
+    // 2. resolve them to column ids (is_ai_column() is kept as a fast path for
+    //    the in-memory schema produced by the DDL resolver)
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_ai_column()) {
+        if (OB_FAIL(add_var_to_array_no_dup(ai_column_ids, column->get_column_id()))) {
+          LOG_WARN("collect ai column id failed", K(ret), K(column->get_column_id()));
+        }
+      } else {
+        const ObString name = column->get_column_name_str();
+        bool matched = false;
+        for (int64_t i = 0; !matched && i < ai_names.count(); ++i) {
+          const ObString &ai_name = ai_names.at(i);
+          matched = (name.length() == ai_name.length()
+                     && 0 == strncasecmp(name.ptr(), ai_name.ptr(), name.length()));
+        }
+        if (matched && OB_FAIL(add_var_to_array_no_dup(ai_column_ids,
+                                                       column->get_column_id()))) {
+          LOG_WARN("collect ai column id failed", K(ret), K(column->get_column_id()));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// An AI column is invalidated (reset to NULL) by the DML layer when one of
+// its dependency columns is changed.  The storage layer only writes the
+// columns that are listed in the row projector, every other column keeps its
+// old value, so the AI column has to be added to the update write set
+// explicitly.  Otherwise the invalidation would be silently dropped and the
+// stale AI result would survive the update.
+static int append_ai_column_id(const ObTableSchema *table_schema,
+                               ObIArray<uint64_t> &minimal_column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 4> ai_column_ids;
+  if (OB_FAIL(collect_ai_column_ids(table_schema, ai_column_ids))) {
+    LOG_WARN("collect ai column ids failed", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_ids.count(); ++i) {
+      if (OB_FAIL(add_var_to_array_no_dup(minimal_column_ids, ai_column_ids.at(i)))) {
+        LOG_WARN("append ai column id failed", K(ret), K(ai_column_ids.at(i)));
+      }
+    }
+  }
+  return ret;
+}
+
+// The storage layer keeps the old value of every column that is not listed in
+// the updated columns of the statement, so the invalidated AI column has to
+// be part of them as well.
+static int append_ai_column_id_to_updated_column_ids(const ObTableSchema *table_schema,
+                                                     ObDASUpdCtDef &das_upd_ctdef)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 4> ai_column_ids;
+  if (OB_FAIL(collect_ai_column_ids(table_schema, ai_column_ids))) {
+    LOG_WARN("collect ai column ids failed", K(ret));
+  } else if (ai_column_ids.count() > 0) {
+    // The updated column ids are stored in a fixed size array whose capacity is
+    // the number of the assignments of the statement.  The array can not grow,
+    // it has to be rebuilt when the AI columns are added to the write set.
+    ObSEArray<uint64_t, 8> new_column_ids;
+    for (int64_t i = 0; OB_SUCC(ret) && i < das_upd_ctdef.updated_column_ids_.count(); ++i) {
+      if (OB_FAIL(new_column_ids.push_back(das_upd_ctdef.updated_column_ids_.at(i)))) {
+        LOG_WARN("collect the updated column ids failed", K(ret), K(i));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_ids.count(); ++i) {
+      const uint64_t column_id = ai_column_ids.at(i);
+      if (!has_exist_in_array(das_upd_ctdef.column_ids_, column_id)) {
+        // the column is not part of the row of the statement
+      } else if (!has_exist_in_array(new_column_ids, column_id)) {
+        if (OB_FAIL(new_column_ids.push_back(column_id))) {
+          LOG_WARN("append ai column id to the updated column ids failed",
+                   K(ret), K(column_id));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && new_column_ids.count() != das_upd_ctdef.updated_column_ids_.count()) {
+      das_upd_ctdef.updated_column_ids_.reset();
+      if (OB_FAIL(das_upd_ctdef.updated_column_ids_.reserve(new_column_ids.count()))) {
+        LOG_WARN("reserve the updated column ids failed", K(ret),
+                 K(new_column_ids.count()));
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < new_column_ids.count(); ++i) {
+          if (OB_FAIL(das_upd_ctdef.updated_column_ids_.push_back(new_column_ids.at(i)))) {
+            LOG_WARN("rebuild the updated column ids failed", K(ret), K(i));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDmlCgService::generate_update_ctdef(ObLogDelUpd &op,
                                           const IndexDMLInfo &index_dml_info,
                                           ObUpdCtDef *&upd_ctdef)
@@ -1403,6 +1536,7 @@ int ObDmlCgService::append_upd_old_row_cid(ObLogicalOperator &op,
   } else if (OB_FAIL(append_upd_assignment_column_id(table_schema,
                                                      das_upd_ctdef,
                                                      minimal_column_ids))) {
+  } else if (OB_FAIL(append_ai_column_id(table_schema, minimal_column_ids))) {
   } else if (OB_FAIL(append_time_type_column_id(table_schema, minimal_column_ids))) {
   } else if (table_schema->is_table_without_pk() &&
       OB_FAIL(append_heap_table_part_key_dependcy_column(table_schema, minimal_column_ids))) {
@@ -1434,6 +1568,7 @@ int ObDmlCgService::generate_minimal_upd_old_row_cid(ObLogDelUpd &op,
   } else if (OB_FAIL(schema_guard->get_table_schema( index_tid, table_schema))) {
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_TABLE_NOT_EXIST;
+  } else if (OB_FAIL(append_ai_column_id_to_updated_column_ids(table_schema, das_upd_ctdef))) {
   } else if (OB_FAIL(check_upd_need_all_columns(op,
                                                 schema_guard,
                                                 table_schema,
