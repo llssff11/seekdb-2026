@@ -39,6 +39,75 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+
+// Default parser properties for the built-in parsers.  They only depend on the
+// parser type, so they are resolved once instead of being serialized to a JSON
+// document and parsed back on every TOKENIZE evaluation.
+struct ObFTDefaultParserProperties
+{
+  storage::ObFTParserProperty ik_;
+  storage::ObFTParserProperty beng_;
+  storage::ObFTParserProperty space_;
+  storage::ObFTParserProperty ngram_;
+  storage::ObFTParserProperty ngram2_;
+};
+
+const ObFTDefaultParserProperties &get_default_parser_properties()
+{
+  static const ObFTDefaultParserProperties props = []() {
+    ObFTDefaultParserProperties result;
+    // IK keeps its dictionary tables and defaults to the smart segmentation mode.
+    result.ik_.dict_table_ = ObString(storage::ObFTSLiteral::CONFIG_NAME_DICT_TABLE);
+    result.ik_.stopword_table_ = ObString(storage::ObFTSLiteral::CONFIG_NAME_STOPWORD_TABLE);
+    result.ik_.quantifier_table_ =
+        ObString(storage::ObFTSLiteral::CONFIG_NAME_QUANTIFIER_TABLE);
+    return result;
+  }();
+  return props;
+}
+
+int get_default_parser_property(const storage::ObFTParser &parser,
+                                const storage::ObFTParserProperty *&property)
+{
+  int ret = OB_SUCCESS;
+  const ObFTDefaultParserProperties &props = get_default_parser_properties();
+  property = nullptr;
+  if (parser.is_ik()) {
+    property = &props.ik_;
+  } else if (parser.is_beng()) {
+    property = &props.beng_;
+  } else if (parser.is_space()) {
+    property = &props.space_;
+  } else if (parser.is_ngram()) {
+    property = &props.ngram_;
+  } else if (parser.is_ngram2()) {
+    property = &props.ngram2_;
+  } else {
+    ret = OB_FUNCTION_NOT_DEFINED;
+  }
+  return ret;
+}
+
+int init_parse_helper_with_default_property(storage::ObFTParseHelper &helper,
+                                            ObIAllocator &allocator,
+                                            const ObString &parser_name)
+{
+  int ret = OB_SUCCESS;
+  storage::ObFTParser parser;
+  const storage::ObFTParserProperty *property = nullptr;
+  if (OB_FAIL(parser.parse_from_str(parser_name.ptr(), parser_name.length()))) {
+  } else if (OB_FAIL(get_default_parser_property(parser, property))) {
+  } else if (OB_ISNULL(property)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(helper.init(&allocator, parser_name, *property))) {
+  }
+  return ret;
+}
+
+}  // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -90,7 +159,13 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
+  } else if (OB_FAIL(param.properties_.empty()
+                         ? init_parse_helper_with_default_property(tokenize_helper,
+                                                                   allocator,
+                                                                   param.parser_name_)
+                         : tokenize_helper.init(&allocator,
+                                                param.parser_name_,
+                                                param.properties_))) {
   } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
   } else if (
       (0 != param.fulltext_.length())
@@ -212,7 +287,8 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+  } else if (!param.properties_.empty()
+             && OB_FAIL(param.reform_parser_properties(param.properties_))) {
   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
   }
   return ret;
@@ -394,16 +470,27 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
   int ret = OB_SUCCESS;
   bool need_to_load_dic = false;
   storage::ObDicLoaderHandle dic_loader_handle;
+  // A dictionary is loaded once per server process.  Cache the loader of this
+  // thread so that repeated TOKENIZE calls skip the global loader lookup as
+  // soon as the dictionary has been loaded.
+  static thread_local storage::ObDicLoader *cached_loader = nullptr;
+  static thread_local ObCharsetType cached_charset = CHARSET_INVALID;
+  const ObCharsetType charset = ObCharset::charset_type_by_coll(meta_.get_collation_type());
   if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
           parser_name_, need_to_load_dic))) {
-  } else if (need_to_load_dic) {
+  } else if (need_to_load_dic
+             && !(nullptr != cached_loader && cached_charset == charset
+                  && cached_loader->is_loaded())) {
     if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
                     ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
-                    ObCharset::charset_type_by_coll(meta_.get_collation_type()),
+                    charset,
                     dic_loader_handle))) {
     } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+    } else {
+      cached_loader = dic_loader_handle.get_loader();
+      cached_charset = charset;
     }
   }
   return ret;

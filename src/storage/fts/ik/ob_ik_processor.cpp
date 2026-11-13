@@ -106,10 +106,10 @@ int TokenizeContext::prepare_next_char()
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,
                                           next_char_len_))) {
-  } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
-                                                       fulltext_ + cursor_,
-                                                       next_char_len_,
-                                                       next_char_type_))) {
+  } else if (OB_FAIL(ObFTCharUtil::classify_first_char_fused(coll_type_,
+                                                             fulltext_ + cursor_,
+                                                             next_char_len_,
+                                                             next_char_type_))) {
   }
   return ret;
 }

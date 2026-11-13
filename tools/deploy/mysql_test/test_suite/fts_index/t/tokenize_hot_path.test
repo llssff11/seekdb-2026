@@ -1,0 +1,78 @@
+# owner: fts
+# owner group: storage
+# description: regression coverage for the full-text tokenizer hot path:
+#   default parser properties, explicit properties, all output modes and the
+#   consistency between TOKENIZE output and MATCH hits after an index build.
+
+--disable_warnings
+drop database if exists fts_tokenize_hot_path;
+create database fts_tokenize_hot_path;
+use fts_tokenize_hot_path;
+set ob_query_timeout = 10000000000;
+
+create table docs (
+  id bigint auto_increment primary key,
+  title varchar(256) not null,
+  content text not null,
+  title_en varchar(256) not null,
+  content_en text not null,
+  fulltext index fti_all(title, content) with parser ik,
+  fulltext index fti_en(title_en, content_en) with parser beng
+) default charset = utf8mb4;
+
+insert into docs (title, content, title_en, content_en) values
+  ('数据库性能优化实践', '全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术。', 'Database performance audit', 'Full-text search indexing requires efficient tokenization on the hot path.'),
+  ('全文索引分词器', '倒排索引是全文检索的核心数据结构，分词质量直接影响查询延迟。', 'Inverted index build', 'Inverted index build performance and query latency under heavy load.'),
+  ('海洋基地', 'OceanBase是一款非常稳定的数据库，支持多种内置分词器。', 'OceanBase stability', 'OceanBase is a stable database with several built in parsers.'),
+  ('英文标题', 'The quick brown fox jumps over the lazy dog.', 'Mixed document', 'Mixed 文档 row=3 for MATCH and TOKENIZE.');
+--enable_warnings
+
+--result_format 4
+
+# built-in default properties: 2-arg form and explicit empty properties must
+# produce exactly the same tokens
+select tokenize('OceanBase是一款非常稳定的数据库', 'ik');
+select tokenize('OceanBase是一款非常稳定的数据库', 'ik', '[]');
+select tokenize('OceanBase是一款非常稳定的数据库', 'ik', '[{"output": "default"}]');
+
+# all output mode (word count + doc_len) is used by the index build path
+select tokenize('中华人民共和国人民大会堂', 'ik', '[{"output": "all"}]');
+select tokenize('中华人民共和国人民大会堂', 'ik', '[{"output": "all"}, {"output": "default"}]');
+
+# ik segmentation modes
+select tokenize('中华人民共和国人民大会堂', 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]');
+select tokenize('中华人民共和国人民大会堂', 'ik', '[{"additional_args": [{"ik_mode": "smart"}]}, {"output": "all"}]');
+
+# the other built-in parsers keep their default properties
+select tokenize('The quick brown fox', 'beng');
+select tokenize('The quick brown fox', 'space');
+select tokenize('The quick brown fox', 'ngram');
+select tokenize('The quick brown fox', 'ngram2');
+select tokenize('hello 中文 world 123', 'space', '[{"output": "all"}]');
+
+# edge cases around the default-property shortcut
+select tokenize('', 'ik');
+select tokenize('a', 'ik');
+select tokenize('a', 'ik', '[]');
+select tokenize('数据库', 'ik');
+select tokenize('IK分词器 ik-smart 3.14 v2.0 测试O2O', 'ik');
+select tokenize('数据库性能优化实践 / Database performance audit', 'ik', '[{"output": "all"}]');
+
+# MATCH results must stay consistent with the TOKENIZE output: the number of
+# documents matching a term equals the number of documents whose token list
+# contains it.
+select count(*) from docs where match(title, content) against('全文索引');
+select count(*) from docs where match(title, content) against('数据库 分词器');
+select count(*) from docs where match(title_en, content_en) against('database build');
+select count(*) from docs where match(title, content) against('倒排索引 tokenizer');
+select count(*) from docs where match(title, content) against('not_exist_token');
+select id from docs where match(title, content) against('数据库') order by id;
+
+# relevance values are unchanged by the tokenizer optimizations
+select id, round(match(title, content) against('数据库 分词器'), 6) as r
+  from docs where match(title, content) against('数据库 分词器') order by r desc, id;
+
+# boolean mode keeps working
+select count(*) from docs where match(title, content) against('+数据库 -倒排索引' in boolean mode);
+
+drop database fts_tokenize_hot_path;

@@ -52,6 +52,16 @@ public:
                                  const uint8_t char_len,
                                  CharType &type);
 
+  /**
+   * Same result as classify_first_char(), but the code point is decoded only
+   * once instead of once per character class.  Used on the segmentation hot
+   * path where every character of the document is classified.
+   */
+  static int classify_first_char_fused(ObCollationType coll_type,
+                                       const char *input,
+                                       const uint8_t char_len,
+                                       CharType &type);
+
   static int check_cn_number(ObCollationType coll_type,
                              const char *input,
                              const uint8_t char_len,
@@ -495,6 +505,34 @@ inline int ObFTCharUtil::classify_first_char(ObCollationType coll_type,
     ret = OB_NOT_SUPPORTED;
     STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
     break;
+  }
+  return ret;
+}
+
+inline int ObFTCharUtil::classify_first_char_fused(ObCollationType coll_type,
+                                                   const char *input,
+                                                   const uint8_t char_len,
+                                                   CharType &type)
+{
+  int ret = OB_SUCCESS;
+  type = CharType::USELESS;
+  if (OB_ISNULL(input)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_FTS_LOG(WARN, "Invalid input", K(input), K(ret));
+  } else if (ObCharset::charset_type_by_coll(coll_type) != CHARSET_UTF8MB4) {
+    ret = classify_first_char(coll_type, input, char_len, type);
+  } else {
+    ob_wc_t unicode = 0;
+    if (OB_FAIL(decode_unicode<CHARSET_UTF8MB4>(input, char_len, unicode))) {
+    } else if (ObUnicodeBlockUtils::is_alpha(unicode)) {
+      type = CharType::ENGLISH_LETTER;
+    } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
+      type = CharType::ARABIC_LETTER;
+    } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
+      type = CharType::CHINESE;
+    } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
+      type = CharType::OTHER_CJK;
+    }
   }
   return ret;
 }

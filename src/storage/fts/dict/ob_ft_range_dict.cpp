@@ -43,6 +43,29 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+// The dictionary ranges are always compared with the binary utf8mb4 collation,
+// where the comparison result is the plain byte order of the two strings.
+// Comparing the bytes directly avoids the generic collation dispatch that
+// ObCharset::strcmp performs on every call.
+inline int cmp_utf8mb4_bin(const ObString &left, const ObString &right)
+{
+  const int64_t min_len = MIN(left.length(), right.length());
+  int cmp_ret = 0;
+  if (min_len > 0) {
+    cmp_ret = MEMCMP(left.ptr(), right.ptr(), min_len);
+  }
+  if (0 == cmp_ret) {
+    if (left.length() < right.length()) {
+      cmp_ret = -1;
+    } else if (left.length() > right.length()) {
+      cmp_ret = 1;
+    }
+  }
+  return cmp_ret;
+}
+}  // namespace
 
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
@@ -382,16 +405,25 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  if (range_dicts_.size() > 0) {
+    // Ranges are built in key order and each range is a disjoint interval of
+    // first characters, so the range that may contain this word can be located
+    // with a binary search over the range starts instead of a linear scan.
+    int64_t left = 0;
+    int64_t right = range_dicts_.size() - 1;
+    int64_t candidate = -1;
+    while (left <= right) {
+      const int64_t mid = left + (right - left) / 2;
+      if (cmp_utf8mb4_bin(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+        candidate = mid;
+        left = mid + 1;
+      } else {
+        right = mid - 1;
+      }
+    }
+    if (candidate >= 0
+        && cmp_utf8mb4_bin(range_dicts_[candidate].end_.get_word(), single_word) >= 0) {
+      dict = range_dicts_[candidate].dict_;
       found = true;
     }
   }

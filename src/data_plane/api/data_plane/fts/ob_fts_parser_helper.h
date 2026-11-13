@@ -162,6 +162,15 @@ public:
       const common::ObString &parser_name,
       const common::ObString &parser_properties);
   /**
+   * Initialize with an already resolved parser property.  Callers that know the
+   * property (for example the built-in default property of a parser) avoid
+   * building and then parsing a properties JSON document on every call.
+   */
+  int init(
+      common::ObIAllocator *allocator,
+      const common::ObString &parser_name,
+      const ObFTParserProperty &parser_property);
+  /**
    * Split document into multiple words
    *
    * @param[in] type, collation type for fulltext
