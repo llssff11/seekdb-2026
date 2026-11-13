@@ -22,6 +22,7 @@
 #include "share/config/ob_server_config.h"
 #include "src/sql/engine/px/ob_dfo.h"
 #include "sql/das/ob_das_simple_op.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "src/sql/engine/px/ob_granule_iterator_op.h"
 
 using namespace oceanbase::common;
@@ -216,6 +217,13 @@ int ObGranuleUtil::split_block_granule(ObExecContext &exec_ctx,
 
   // 3. calc the total number of tasks for all partitions
   int64_t esti_task_cnt_by_data_size = 0;
+  bool force_ddl_parallel_split = false;
+  if (OB_SUCC(ret) && parallelism > 1) {
+    ObSQLSessionInfo *my_session = exec_ctx.get_my_session();
+    if (nullptr != my_session && my_session->get_ddl_info().is_ddl()) {
+      force_ddl_parallel_split = true;
+    }
+  }
   if (OB_SUCC(ret)) {
     data_plane::ObParallelRangeTaskParams params(config::px_task_size() >> 10);
     params.parallelism_ = parallelism;
@@ -227,6 +235,17 @@ int ObGranuleUtil::split_block_granule(ObExecContext &exec_ctx,
       // Ensure total task count is greater than or equal to the number of partitions
       if (esti_task_cnt_by_data_size < tablets.count()) {
         esti_task_cnt_by_data_size = tablets.count();
+      }
+      // For a DDL (index build) session the data size estimate is usually a rough
+      // 2MB placeholder, which collapses the whole build onto a single granule and
+      // leaves every other PX worker idle.  Honour the requested DOP instead: one
+      // contiguous primary key range per worker.
+      if (!force_ddl_parallel_split || esti_task_cnt_by_data_size >= parallelism) {
+        // nothing to do
+      } else {
+        LOG_INFO("force ddl parallel granule split", K(parallelism), K(total_size),
+                 K(esti_task_cnt_by_data_size), K(tablets.count()));
+        esti_task_cnt_by_data_size = parallelism;
       }
     }
   }

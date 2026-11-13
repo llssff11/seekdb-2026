@@ -1040,14 +1040,26 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
   if (OB_UNLIKELY(original_parallelism <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
+    // The inverted index and doc word auxiliary tables are filled by scanning the
+    // data table and expanding every row into many index rows, which is pure CPU
+    // work, so they need the full requested degree: dividing it by three left the
+    // scan and the row expansion with a fraction of the workers.  When the caller
+    // did not ask for a degree, derive one from the machine size instead of
+    // building single threaded.
+    const int64_t default_fts_parallelism =
+        MAX(static_cast<int64_t>(1),
+            MIN(static_cast<int64_t>(get_cpu_num()), static_cast<int64_t>(8)));
+    const int64_t fts_build_parallelism = MAX(original_parallelism, default_fts_parallelism);
     switch (index_type) {
       case share::schema::ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL:
         decided_parallelism = MAX(original_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        break;
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        decided_parallelism = fts_build_parallelism;
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:

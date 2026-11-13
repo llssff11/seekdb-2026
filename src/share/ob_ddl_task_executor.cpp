@@ -350,7 +350,11 @@ int ObDDLLocalBuilder::push_task(ObAsyncTask &task)
 
 int64_t ObDDLLocalBuilder::get_thread_cnt_() const
 {
-  return lib::is_mini_mode() ? 1 : 16;
+  // A single local builder thread serialises every local index build on the node,
+  // so the auxiliary tables of one full-text index (inverted index / doc word) can
+  // never be filled concurrently and the whole DDL runs at the speed of one thread.
+  // Give mini mode a small pool as well.
+  return lib::is_mini_mode() ? 4 : 16;
 }
 
 }  // end namespace share
