@@ -33,7 +33,6 @@
 #include "sql/optimizer/ob_log_expr_values.h"
 #include "sql/optimizer/ob_log_function_table.h"
 #include "sql/optimizer/ob_log_json_table.h"
-#include "sql/optimizer/ob_log_file_table.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_exchange.h"
 #include "sql/optimizer/ob_log_values.h"
@@ -2252,30 +2251,6 @@ int ObLogPlan::allocate_function_table_path(FunctionTablePath *func_table_path,
   return ret;
 }
 
-int ObLogPlan::allocate_file_table_path(FileTablePath *file_table_path,
-                                       ObLogicalOperator *&out_access_path_op)
-{
-  int ret = OB_SUCCESS;
-  ObLogFileTable *op = NULL;
-  TableItem *table_item = NULL;
-  if (OB_ISNULL(file_table_path) || OB_ISNULL(get_stmt()) ||
-      OB_ISNULL(table_item = get_stmt()->get_table_item_by_id(file_table_path->table_id_))) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(op = static_cast<ObLogFileTable *>(get_log_op_factory().
-                                        allocate(*this, LOG_FILE_TABLE)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else {
-    op->set_table_id(file_table_path->table_id_);
-    if (OB_FAIL(append(op->get_filter_exprs(), file_table_path->filter_))) {
-    } else if (OB_FAIL(op->compute_property(file_table_path))) {
-    } else if (OB_FAIL(op->pick_out_startup_filters())) {
-    } else {
-      out_access_path_op = op;
-    }
-  }
-  return ret;
-}
-
 int ObLogPlan::allocate_json_table_path(JsonTablePath *json_table_path,
                                         ObLogicalOperator *&out_access_path_op)
 {
@@ -3527,10 +3502,6 @@ int ObLogPlan::create_plan_tree_from_path(Path *path,
     } else if (path->is_json_table_path()) {
       JsonTablePath *json_table_path = static_cast<JsonTablePath *>(path);
       if (OB_FAIL(allocate_json_table_path(json_table_path, op))) {
-      } else { /* Do nothing */ }
-    } else if (path->is_file_table_path()) {
-      FileTablePath *file_table_path = static_cast<FileTablePath *>(path);
-      if (OB_FAIL(allocate_file_table_path(file_table_path, op))) {
       } else { /* Do nothing */ }
     } else if (path->is_temp_table_path()) {
       TempTablePath *temp_table_path = static_cast<TempTablePath *>(path);
@@ -6859,22 +6830,6 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
       select_into->set_external_properties(into_item->external_properties_);
-      select_into->set_with_header(into_item->with_header_);
-      if (into_item->with_header_) {
-        ObSEArray<ObString, 16> column_names;
-        for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_select_item_size(); ++i) {
-          const SelectItem &select_item = stmt->get_select_item(i);
-          const ObString &name = select_item.alias_name_.empty()
-                                 ? select_item.expr_name_ : select_item.alias_name_;
-          if (OB_FAIL(column_names.push_back(name))) {
-            LOG_WARN("failed to push back column name", K(ret));
-          }
-        }
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(select_into->set_column_names(column_names))) {
-          LOG_WARN("failed to set column names", K(ret));
-        }
-      }
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       // compute property
       if (OB_FAIL(select_into->compute_property())) {
