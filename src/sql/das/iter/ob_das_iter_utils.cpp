@@ -1496,8 +1496,11 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
     if (ir_scan_ctdef->has_pushdown_topk() && !has_duplicate_boolean_tokens) {
       merge_iter_param.topk_mode_ = 1;
       merge_iter_param.daat_mode_ = 1;
-    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT
-        || (!is_func_lookup && !ir_scan_ctdef->need_proj_relevance_score())) {
+    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT) {
+      // Only the token count selects TAAT.  A missing relevance projection must
+      // not: both modes merge the same document ids, DAAT is what the per-token
+      // inverted index scans are set up for, and TAAT accumulates through a hash
+      // table sized by the estimated document count.
       if (BOOLEAN_MODE == ir_scan_ctdef->mode_flag_) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "Boolean mode with more than 256 tokens is");
@@ -1537,7 +1540,9 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (size > 0 && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
+  } else if (size > 0 && ir_scan_ctdef->need_calc_relevance()
+             && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
+    // The total document count aggregation is only needed to normalize BM25.
     ObDASScanIterParam doc_cnt_agg_param;
     ObDASScanIter *doc_cnt_agg_iter = nullptr;
     init_scan_iter_param(doc_cnt_agg_param, ir_scan_ctdef->get_doc_agg_ctdef(), ir_scan_rtdef);

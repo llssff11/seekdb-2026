@@ -112,9 +112,20 @@ struct ObSparseRetrievalMergeParam
       filter_expr_(nullptr),
       topk_limit_(0),
       field_boost_(1.0),
-      max_batch_size_(1)
+      max_batch_size_(1),
+      no_output_(false)
   {}
   ~ObSparseRetrievalMergeParam() {}
+  // The caller consumes no column at all: the merge only has to count the
+  // documents that satisfy minimum_should_match.
+  bool need_count_only() const
+  {
+    return no_output_
+        && nullptr == filter_expr_
+        && nullptr == relevance_proj_expr_
+        && topk_limit_ <= 0
+        && (nullptr == limit_param_ || !limit_param_->is_valid());
+  }
   bool need_project_relevance() const { return relevance_proj_expr_ != nullptr; }
   bool need_filter() const { return filter_expr_ != nullptr; }
   bool need_pushdown_topk() const { return topk_limit_ > 0; }
@@ -131,6 +142,7 @@ struct ObSparseRetrievalMergeParam
   int64_t topk_limit_;
   double field_boost_;
   int64_t max_batch_size_;
+  bool no_output_;
 };
 
 class ObISparseRetrievalMergeIter

@@ -33,6 +33,7 @@
 #include "sql/optimizer/ob_log_expr_values.h"
 #include "sql/optimizer/ob_log_function_table.h"
 #include "sql/optimizer/ob_log_json_table.h"
+#include "sql/optimizer/ob_log_file_table.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_exchange.h"
 #include "sql/optimizer/ob_log_values.h"
@@ -2251,6 +2252,30 @@ int ObLogPlan::allocate_function_table_path(FunctionTablePath *func_table_path,
   return ret;
 }
 
+int ObLogPlan::allocate_file_table_path(FileTablePath *file_table_path,
+                                       ObLogicalOperator *&out_access_path_op)
+{
+  int ret = OB_SUCCESS;
+  ObLogFileTable *op = NULL;
+  TableItem *table_item = NULL;
+  if (OB_ISNULL(file_table_path) || OB_ISNULL(get_stmt()) ||
+      OB_ISNULL(table_item = get_stmt()->get_table_item_by_id(file_table_path->table_id_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(op = static_cast<ObLogFileTable *>(get_log_op_factory().
+                                        allocate(*this, LOG_FILE_TABLE)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    op->set_table_id(file_table_path->table_id_);
+    if (OB_FAIL(append(op->get_filter_exprs(), file_table_path->filter_))) {
+    } else if (OB_FAIL(op->compute_property(file_table_path))) {
+    } else if (OB_FAIL(op->pick_out_startup_filters())) {
+    } else {
+      out_access_path_op = op;
+    }
+  }
+  return ret;
+}
+
 int ObLogPlan::allocate_json_table_path(JsonTablePath *json_table_path,
                                         ObLogicalOperator *&out_access_path_op)
 {
@@ -3502,6 +3527,10 @@ int ObLogPlan::create_plan_tree_from_path(Path *path,
     } else if (path->is_json_table_path()) {
       JsonTablePath *json_table_path = static_cast<JsonTablePath *>(path);
       if (OB_FAIL(allocate_json_table_path(json_table_path, op))) {
+      } else { /* Do nothing */ }
+    } else if (path->is_file_table_path()) {
+      FileTablePath *file_table_path = static_cast<FileTablePath *>(path);
+      if (OB_FAIL(allocate_file_table_path(file_table_path, op))) {
       } else { /* Do nothing */ }
     } else if (path->is_temp_table_path()) {
       TempTablePath *temp_table_path = static_cast<TempTablePath *>(path);
@@ -6830,6 +6859,22 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
       select_into->set_external_properties(into_item->external_properties_);
+      select_into->set_with_header(into_item->with_header_);
+      if (into_item->with_header_) {
+        ObSEArray<ObString, 16> column_names;
+        for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_select_item_size(); ++i) {
+          const SelectItem &select_item = stmt->get_select_item(i);
+          const ObString &name = select_item.alias_name_.empty()
+                                 ? select_item.expr_name_ : select_item.alias_name_;
+          if (OB_FAIL(column_names.push_back(name))) {
+            LOG_WARN("failed to push back column name", K(ret));
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(select_into->set_column_names(column_names))) {
+          LOG_WARN("failed to set column names", K(ret));
+        }
+      }
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       // compute property
       if (OB_FAIL(select_into->compute_property())) {
@@ -11987,6 +12032,142 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+
+namespace
+{
+
+// Whether `target` occurs anywhere in the expression tree rooted at `expr`.
+int text_retrieval_expr_contains(const ObRawExpr *expr,
+                                 const ObRawExpr *target,
+                                 bool &found)
+{
+  int ret = OB_SUCCESS;
+  found = false;
+  if (OB_ISNULL(expr)) {
+  } else if (expr == target) {
+    found = true;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !found && i < expr->get_param_count(); ++i) {
+      if (OB_FAIL(SMART_CALL(text_retrieval_expr_contains(expr->get_param_expr(i), target, found)))) {
+      }
+    }
+  }
+  return ret;
+}
+
+// A match expression used as a plain boolean predicate only needs its boolean
+// result, not the numeric BM25 score.  Any other use (a comparison with a
+// constant, arithmetic, a function call ...) consumes the score.
+int text_retrieval_cond_consumes_score(const ObRawExpr *cond,
+                                       const ObRawExpr *match,
+                                       bool &consumes)
+{
+  int ret = OB_SUCCESS;
+  consumes = false;
+  bool has_match = false;
+  if (OB_ISNULL(cond)) {
+  } else if (OB_FAIL(text_retrieval_expr_contains(cond, match, has_match))) {
+  } else if (!has_match) {
+  } else if (cond == match) {
+    // `WHERE MATCH(...)`: only the boolean result is used
+  } else if (T_OP_AND == cond->get_expr_type()
+             || T_OP_OR == cond->get_expr_type()
+             || T_OP_NOT == cond->get_expr_type()
+             || T_OP_BOOL == cond->get_expr_type()) {
+    for (int64_t i = 0; OB_SUCC(ret) && !consumes && i < cond->get_param_count(); ++i) {
+      if (OB_FAIL(SMART_CALL(
+              text_retrieval_cond_consumes_score(cond->get_param_expr(i), match, consumes)))) {
+      }
+    }
+  } else {
+    consumes = true;
+  }
+  return ret;
+}
+
+// The score of `match` is unused when the statement neither projects, sorts,
+// groups nor compares it: the inverted index scan alone already produces
+// exactly the matching documents.
+int text_retrieval_score_is_unused(const ObDMLStmt *stmt,
+                                   const ObRawExpr *match,
+                                   bool &unused)
+{
+  int ret = OB_SUCCESS;
+  unused = false;
+  bool used = false;
+  if (OB_ISNULL(stmt) || OB_ISNULL(match)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (stmt->is_select_stmt()) {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < select_stmt->get_select_item_size(); ++i) {
+      if (OB_FAIL(text_retrieval_expr_contains(select_stmt->get_select_item(i).expr_, match, used))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < select_stmt->get_order_item_size(); ++i) {
+      if (OB_FAIL(text_retrieval_expr_contains(select_stmt->get_order_item(i).expr_, match, used))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < select_stmt->get_group_expr_size(); ++i) {
+      if (OB_FAIL(text_retrieval_expr_contains(select_stmt->get_group_exprs().at(i), match, used))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < select_stmt->get_having_expr_size(); ++i) {
+      if (OB_FAIL(text_retrieval_expr_contains(select_stmt->get_having_exprs().at(i), match, used))) {
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !used && i < stmt->get_condition_size(); ++i) {
+    bool consumes = false;
+    if (OB_FAIL(text_retrieval_cond_consumes_score(stmt->get_condition_exprs().at(i), match, consumes))) {
+    } else if (consumes) {
+      used = true;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    unused = !used;
+  }
+  return ret;
+}
+
+// Whether every branch of the pushed-down predicate is the match expression
+// itself.  Such a predicate only repeats the document set that the inverted
+// index scan already returns, so evaluating it per row decides nothing.
+int text_retrieval_pred_is_pure_match(const ObRawExpr *pred,
+                                      const ObRawExpr *match,
+                                      bool &pure)
+{
+  int ret = OB_SUCCESS;
+  pure = false;
+  if (OB_ISNULL(pred)) {
+  } else if (pred == match) {
+    pure = true;
+  } else if (T_OP_AND == pred->get_expr_type()
+             || T_OP_OR == pred->get_expr_type()
+             || T_OP_BOOL == pred->get_expr_type()) {
+    bool contains = false;
+    if (OB_FAIL(text_retrieval_expr_contains(pred, match, contains))) {
+    } else if (!contains) {
+      pure = false;
+    } else {
+      pure = true;
+      for (int64_t i = 0; OB_SUCC(ret) && pure && i < pred->get_param_count(); ++i) {
+        if (OB_FAIL(SMART_CALL(
+                text_retrieval_pred_is_pure_match(pred->get_param_expr(i), match, pure)))) {
+        }
+      }
+    }
+  } else {
+    bool contains = false;
+    if (OB_FAIL(text_retrieval_expr_contains(pred, match, contains))) {
+    } else {
+      pure = false; // a predicate that also computes something needs the score
+    }
+  }
+  return ret;
+}
+
+}  // namespace
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,
@@ -12039,6 +12220,25 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    // A `WHERE MATCH(...)` used as a plain boolean predicate only needs the
+    // document set of the inverted index scan: every document that contains a
+    // query token has a strictly positive score, so neither the per-row BM25
+    // evaluation nor the pushed-down match filter decides anything.  Keep both
+    // when the statement consumes the score (projection, sort, group, having, a
+    // comparison) and in boolean mode, whose match semantics are computed from
+    // the per-token scores.
+    bool score_unused = false;
+    bool pure_match = false;
+    if (BOOLEAN_MODE != match_against->get_mode_flag()
+        && OB_SUCCESS == text_retrieval_score_is_unused(get_stmt(), match_against, score_unused)
+        && score_unused
+        && OB_SUCCESS == text_retrieval_pred_is_pure_match(match_pred, match_against, pure_match)
+        && pure_match) {
+      // The scan may still have to project a column (then it needs the score for
+      // the predicate); the code generator takes the final decision once the
+      // output expressions are known.
+      tr_info.can_skip_score_ = true;
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {

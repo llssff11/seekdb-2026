@@ -86,6 +86,7 @@ public:
 protected:
   virtual int pre_process();
   virtual int do_one_merge_round(int64_t &count);
+  virtual int do_one_count_round(int64_t &count);
   virtual int fill_merge_heap();
   virtual int collect_dims_by_id(const ObDatum *&id_datum, double &relevance, bool &got_valid_id);
   virtual int process_collected_row(const ObDatum &id_datum, const double relevance);

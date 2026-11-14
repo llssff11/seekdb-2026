@@ -1796,12 +1796,6 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
                                            ObDASBaseCtDef *&root_ctdef)
 {
   int ret = OB_SUCCESS;
-  const ObTextRetrievalInfo &tr_info = cg_ctx.is_vec_iter_func_lookup_ ? op.get_vec_iter_tr_infos().at(cg_ctx.curr_func_lookup_idx_)
-                                     : cg_ctx.is_func_lookup_ ? op.get_lookup_tr_infos().at(cg_ctx.curr_func_lookup_idx_)
-                                     : cg_ctx.is_es_match_ ? op.get_match_tr_infos().at(cg_ctx.curr_match_idx_)
-                                     : cg_ctx.is_merge_fts_index_ ? op.get_merge_tr_infos().at(cg_ctx.curr_merge_fts_idx_)
-                                     : op.get_text_retrieval_info();
-  ObMatchFunRawExpr *match_against = tr_info.match_expr_;
   ObIAllocator &ctdef_alloc = cg_.phy_plan_->get_allocator();
   ObSqlSchemaGuard *schema_guard = cg_.opt_ctx_->get_sql_schema_guard();
   ObDASIRScanCtDef *ir_scan_ctdef = nullptr;
@@ -1809,6 +1803,22 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
   ObDASScanCtDef *inv_idx_scan_ctdef = nullptr;
   ObExpr *index_back_doc_id_column = nullptr;
   bool has_rowscn = false;
+  // A scan that projects nothing and whose predicate is nothing but the match
+  // expression (`SELECT COUNT(*) ... WHERE MATCH(...)`) does not need the per-row
+  // BM25 score: the inverted index scan already returns exactly the matching
+  // documents.  Everything else keeps the original path.
+  ObTextRetrievalInfo tr_info_copy = cg_ctx.is_vec_iter_func_lookup_ ? op.get_vec_iter_tr_infos().at(cg_ctx.curr_func_lookup_idx_)
+                                     : cg_ctx.is_func_lookup_ ? op.get_lookup_tr_infos().at(cg_ctx.curr_func_lookup_idx_)
+                                     : cg_ctx.is_es_match_ ? op.get_match_tr_infos().at(cg_ctx.curr_match_idx_)
+                                     : cg_ctx.is_merge_fts_index_ ? op.get_merge_tr_infos().at(cg_ctx.curr_merge_fts_idx_)
+                                     : op.get_text_retrieval_info();
+  const bool skip_score = tr_info_copy.can_skip_score_ && op.get_output_exprs().empty();
+  if (skip_score) {
+    tr_info_copy.need_calc_relevance_ = false;
+    tr_info_copy.pushdown_match_filter_ = nullptr;
+  }
+  const ObTextRetrievalInfo &tr_info = tr_info_copy;
+  ObMatchFunRawExpr *match_against = tr_info.match_expr_;
   if (OB_ISNULL(match_against) || OB_ISNULL(schema_guard)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_UNLIKELY(OB_INVALID_ID == tr_info.inv_idx_tid_)) {
@@ -1894,6 +1904,11 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
 
   if (OB_SUCC(ret)) {
     root_ctdef = ir_scan_ctdef;
+    // A text retrieval scan that produces no column and consumes neither a score
+    // nor a pushed-down match filter only has to report how many documents
+    // matched (e.g. `SELECT COUNT(*) FROM t WHERE MATCH(...)`).  The merge
+    // iterator may then skip the per-row projection entirely.
+    ir_scan_ctdef->has_no_output_ = skip_score;
     if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef))) {
     } else {
       const ObCostTableScanInfo *est_cost_info = op.get_est_cost_info();
